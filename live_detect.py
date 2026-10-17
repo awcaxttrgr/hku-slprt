@@ -1,21 +1,12 @@
 import cv2
 import mediapipe as mp
-import os
+from collections import deque
+from pathlib import Path
 from google.protobuf.json_format import MessageToDict
-# import json
 import numpy as np
-from io import BytesIO
-from PIL import Image
 
 import torch
-from torch import nn
-from torch import optim
-import torch.nn.functional as F
-import os
-import numpy as np
-import matplotlib.pyplot as plt
 
-from paths import *
 from model_model import LinearHandshapePredictor
 from model_configs import *
 
@@ -90,55 +81,54 @@ def dict2array(dict_data):
 hsdict = FixedHandshapeDict()
 def model_predict(model, features, hsdict): 
     this_features = torch.from_numpy(features)
-    batch_num, lm_num, dim_num = this_features.size()
-    x = this_features
-    x = x.to(device)
-    x = x.to(torch.float32)
-    hid_rep, pred = model.predict(x, hsdict)
-    hid_rep = hid_rep.cpu().detach().numpy()
+    x = this_features.to(next(model.parameters()).device, dtype=torch.float32)
+    with torch.inference_mode():
+        hid_rep, pred = model.predict(x, hsdict)
+    hid_rep = hid_rep.cpu().numpy()
     return hid_rep, pred
+
 class ListBuffer: 
     def __init__(self, buffer_size) -> None:
-        self.buffer = []
-        self.buffer_size = buffer_size
+        self.buffer = deque(maxlen=buffer_size)
     def append(self, item): 
         self.buffer.append(item)
-        if len(self.buffer) > self.buffer_size: 
-            self.buffer.pop(0)
     def get(self): 
-        return self.buffer
+        return list(self.buffer)
     def stack_and_get(self): 
         return np.stack(self.buffer, axis=0)
 class HandDetection:
-    def __init__(self, video_path=None):
+    def __init__(self, model, video_path=None):
+        self.model = model
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
-        self.handshape_dir = "./hs_char/"
+        self.handshape_dir = Path(__file__).resolve().parent / "hs_char"
+        self.handshape_images = {}
+        self.missing_handshape_images = set()
         self.saved_frames_hidrep_right = ListBuffer(10)
         self.saved_frames_hidrep_left = ListBuffer(10)
-        try_times = 10
         try_idxs = [-1, 0, 1, 2, -2]
 
-        # Try opening the webcam or loading a video file
-        for i in range(try_times): 
-            for idx in try_idxs: 
-                print(f"Trying to open the webcam (attempt {i+1}/{try_times})...")
-                self.cap = cv2.VideoCapture(idx)
-                if self.cap.isOpened():
-                    break
+        for idx in try_idxs:
+            print(f"Trying to open webcam {idx}...")
+            self.cap = cv2.VideoCapture(idx)
             if self.cap.isOpened():
-                    break
+                break
+            self.cap.release()
         if not self.cap.isOpened():
             print("No webcam found! Loading a video file...")
-            if video_path and os.path.exists(video_path):
-                self.cap = cv2.VideoCapture(video_path)
-            else: 
-                print("No video file found! Please provide a valid video file.")
-                exit(1)
-        # Set higher resolution for the camera
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)  # Change to preferred width
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)  # Change to preferred height
+            if video_path and Path(video_path).is_file():
+                self.cap = cv2.VideoCapture(str(video_path))
+            else:
+                raise FileNotFoundError(
+                    f"No webcam found and video file is unavailable: {video_path}"
+                )
+            if not self.cap.isOpened():
+                self.cap.release()
+                raise RuntimeError(f"Unable to open video file: {video_path}")
+        # Request 1080p capture for a sharper fullscreen render when supported.
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
         # Store the actual frame width and height
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -146,128 +136,219 @@ class HandDetection:
 
     def overlay_handshape(self, frame, prediction, position=(50, 50), size=(120, 120)):
         """Overlay predicted handshape image on the frame with a white background."""
-        handshape_path = os.path.join(self.handshape_dir, f"{prediction}.png")
-        if os.path.exists(handshape_path):
-            handshape_img = cv2.imread(handshape_path, cv2.IMREAD_UNCHANGED)
-            handshape_img = cv2.resize(handshape_img, size)
-
-            # Ensure the image has an alpha channel (RGBA)
-            if handshape_img.shape[2] == 4:
-                overlay = handshape_img[:, :, :3]  # Extract RGB
-                alpha = handshape_img[:, :, 3] / 255.0  # Normalize alpha
+        handshape_path = self.handshape_dir / f"{ord(prediction):03d}.png"
+        cache_key = (prediction, size)
+        if cache_key not in self.handshape_images and cache_key not in self.missing_handshape_images:
+            if not handshape_path.is_file():
+                print(f"Handshape image not found: {handshape_path}")
+                self.missing_handshape_images.add(cache_key)
             else:
-                overlay = handshape_img
-                alpha = np.ones((size[1], size[0]))  # No transparency
+                handshape_img = cv2.imread(str(handshape_path), cv2.IMREAD_UNCHANGED)
+                if handshape_img is None:
+                    raise ValueError(f"Unable to read handshape image: {handshape_path}")
+                handshape_img = cv2.resize(handshape_img, size)
+                if handshape_img.ndim == 2:
+                    handshape_img = cv2.cvtColor(handshape_img, cv2.COLOR_GRAY2BGR)
+                elif handshape_img.shape[2] == 4:
+                    handshape_img = handshape_img[:, :, :3]
 
-            # Create a white background with a border
-            white_bg = np.ones((size[1] + 10, size[0] + 10, 3), dtype=np.uint8) * 255
-            x_offset, y_offset = 5, 5
-            white_bg[y_offset:y_offset+size[1], x_offset:x_offset+size[0]] = overlay
+                white_bg = np.full((size[1] + 10, size[0] + 10, 3), 255, dtype=np.uint8)
+                white_bg[5:5 + size[1], 5:5 + size[0]] = handshape_img
+                self.handshape_images[cache_key] = white_bg
 
-            # Overlay the final image on the frame
+        handshape_tile = self.handshape_images.get(cache_key)
+        if handshape_tile is not None:
             x, y = position
-            h, w = white_bg.shape[:2]
-            frame[y:y+h, x:x+w] = white_bg
+            h, w = handshape_tile.shape[:2]
+            frame[y:y + h, x:x + w] = handshape_tile
 
         return frame
 
     def plot_hidden_representation(self, hidden_rep, size=(250, 150)):
-        """Generate and return a small line plot of the hidden representation."""
-        fig, ax = plt.subplots(figsize=(3, 2), dpi=100)
+        """Render hidden activations without creating per-frame Matplotlib figures."""
+        canvas = np.full((size[1], size[0], 3), 255, dtype=np.uint8)
+        num_frames, num_dims = hidden_rep.shape
+        if num_frames == 0 or num_dims == 0:
+            return canvas
 
-        num_dims = hidden_rep.shape[1]  # Assuming hidden_rep is (frames, dimensions)
-        colors = plt.cm.viridis(np.linspace(0, 1, num_dims))  # Use a visually distinct colormap
-        for dim, color in zip(range(num_dims), colors):
-            ax.plot(hidden_rep[:, dim], color=color, linewidth=1.8, label=f'Dim {dim+1}')
+        values = np.asarray(hidden_rep, dtype=np.float32)
+        value_min = float(values.min())
+        value_max = float(values.max())
+        value_range = value_max - value_min
+        if value_range == 0:
+            value_range = 1.0
 
-        # ax.set_xlabel("Time (Frames)", fontsize=8, color="black")
-        # ax.set_ylabel("Hidden Representation", fontsize=8, color="black")
+        x_coords = np.linspace(0, size[0] - 1, num_frames).astype(np.int32)
+        colors = cv2.applyColorMap(
+            np.linspace(0, 255, num_dims, dtype=np.uint8).reshape(1, -1),
+            cv2.COLORMAP_VIRIDIS,
+        )[0]
+        for dim, color in enumerate(colors):
+            y_coords = size[1] - 1 - (
+                (values[:, dim] - value_min) / value_range * (size[1] - 1)
+            ).astype(np.int32)
+            points = np.column_stack((x_coords, y_coords)).reshape(-1, 1, 2)
+            cv2.polylines(canvas, [points], False, tuple(int(c) for c in color), 2)
 
-        # Improve style for visibility
-        ax.set_xticks([])
-        ax.set_yticks([])
-        # ax.legend(fontsize=6, loc='upper right', frameon=False)  
-        ax.set_facecolor("white")  
-        fig.patch.set_facecolor("white")
-
-        # Convert plot to image
-        buf = BytesIO()
-        plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0, dpi=100)
-        plt.close(fig)
-
-        buf.seek(0)
-        img = Image.open(buf).convert("RGB")
-        img = img.resize(size)
-
-        return np.array(img)
+        return canvas
 
     def detect(self):
-        with self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5) as hands:
-            counter = 0
-            
-            while self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("End of video or camera disconnected.")
-                    break
+        try:
+            window_name = "Hand Detection with Overlays"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(
+                window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+            )
+            cv2.waitKey(1)
+            _, _, screen_width, screen_height = cv2.getWindowImageRect(window_name)
+            if screen_width <= 0 or screen_height <= 0:
+                raise RuntimeError(
+                    f"Unable to determine fullscreen render size: "
+                    f"{screen_width}x{screen_height}"
+                )
+            resolution_percent = 100
+            with self.mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5) as hands:
+                while self.cap.isOpened():
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        print("End of video or camera disconnected.")
+                        break
 
-                counter += 1
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    rgb_frame = cv2.flip(rgb_frame, 1)  # Mirror effect
+                    results = hands.process(rgb_frame)
 
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                rgb_frame = cv2.flip(rgb_frame, 1)  # Mirror effect
-                
-                results = hands.process(rgb_frame)
+                    right_lm = sol2json(results, None, "Right")
+                    left_lm = sol2json(results, None, "Left")
+                    right_lm_array = dict2array(right_lm)
+                    left_lm_array = dict2array(left_lm)
 
-                right_lm = sol2json(results, os.path.join("jsonsave", f"hand_landmarks_{counter}.json"), "Right")
-                left_lm = sol2json(results, os.path.join("jsonsave", f"hand_landmarks_{counter}.json"), "Left")
+                    hid_rep_right, pred_right = model_predict(self.model, right_lm_array, hsdict)
+                    hid_rep_left, pred_left = model_predict(self.model, left_lm_array, hsdict)
+                    self.saved_frames_hidrep_right.append(hid_rep_right[0])
+                    self.saved_frames_hidrep_left.append(hid_rep_left[0])
 
-                right_lm_array = dict2array(right_lm)
-                left_lm_array = dict2array(left_lm)
+                    annotated_frame = cv2.flip(frame.copy(), 1)
+                    if results.multi_hand_landmarks:
+                        for hand_landmarks in results.multi_hand_landmarks:
+                            self.mp_drawing.draw_landmarks(
+                                annotated_frame,
+                                hand_landmarks,
+                                self.mp_hands.HAND_CONNECTIONS,
+                                self.mp_drawing_styles.get_default_hand_landmarks_style(),
+                                self.mp_drawing_styles.get_default_hand_connections_style()
+                            )
 
-                hid_rep_right, pred_right = model_predict(model, right_lm_array, hsdict)
-                hid_rep_left, pred_left = model_predict(model, left_lm_array, hsdict)
+                    height, width = annotated_frame.shape[:2]
+                    banner_height = max(56, height // 12)
+                    result_margin = max(20, width // 40)
+                    result_size = (120, 120)
+                    result_gap = max(16, height // 40)
+                    result_x = result_margin
+                    result_y = banner_height + result_margin
+                    annotated_frame = self.overlay_handshape(
+                        annotated_frame, pred_right[0],
+                        position=(result_x, result_y), size=result_size,
+                    )
+                    annotated_frame = self.overlay_handshape(
+                        annotated_frame, pred_left[0],
+                        position=(result_x, result_y + result_size[1] + 10 + result_gap),
+                        size=result_size,
+                    )
 
-                self.saved_frames_hidrep_right.append(hid_rep_right[0])
-                self.saved_frames_hidrep_left.append(hid_rep_left[0])
+                    hidden_plot_size = (350, 150)
+                    hidden_plot_right = self.plot_hidden_representation(self.saved_frames_hidrep_right.stack_and_get(), size=hidden_plot_size)
+                    hidden_plot_left = self.plot_hidden_representation(self.saved_frames_hidrep_left.stack_and_get(), size=hidden_plot_size)
+                    footer_height = max(34, height // 20)
+                    plot_margin = max(20, width // 40)
+                    plot_x = max(0, width - hidden_plot_size[0] - plot_margin)
+                    plot_y_right = banner_height + plot_margin
+                    plot_y_left = plot_y_right + hidden_plot_size[1] + plot_margin
+                    if plot_y_left + hidden_plot_size[1] <= height - footer_height - plot_margin:
+                        annotated_frame[
+                            plot_y_right:plot_y_right + hidden_plot_size[1],
+                            plot_x:plot_x + hidden_plot_size[0],
+                        ] = hidden_plot_right
+                        annotated_frame[
+                            plot_y_left:plot_y_left + hidden_plot_size[1],
+                            plot_x:plot_x + hidden_plot_size[0],
+                        ] = hidden_plot_left
 
-                annotated_frame = cv2.flip(frame.copy(), 1)
-                if results.multi_hand_landmarks:
-                    for hand_landmarks in results.multi_hand_landmarks:
-                        self.mp_drawing.draw_landmarks(
-                            annotated_frame,
-                            hand_landmarks,
-                            self.mp_hands.HAND_CONNECTIONS,
-                            self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                            self.mp_drawing_styles.get_default_hand_connections_style()
+                    overlay = annotated_frame.copy()
+                    cv2.rectangle(overlay, (0, 0), (width, banner_height), (0, 0, 0), -1)
+                    cv2.rectangle(
+                        overlay,
+                        (0, height - footer_height),
+                        (width, height),
+                        (0, 0, 0),
+                        -1,
+                    )
+                    cv2.addWeighted(overlay, 0.65, annotated_frame, 0.35, 0, annotated_frame)
+
+                    title = "HKU Linguistics: HKSL Handshape Detection Model Demonstration"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    title_scale = min(0.9, (width - 40) / max(
+                        cv2.getTextSize(title, font, 1.0, 2)[0][0], 1
+                    ))
+                    title_size, _ = cv2.getTextSize(title, font, title_scale, 2)
+                    title_x = max((width - title_size[0]) // 2, 10)
+                    cv2.putText(
+                        annotated_frame,
+                        title,
+                        (title_x, banner_height // 2 + title_size[1] // 2),
+                        font,
+                        title_scale,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    footer = (
+                        f"[W] +10%  [E] -10%  Resolution: {resolution_percent}%  [Q] Quit"
+                    )
+                    footer_scale = 0.6
+                    footer_size, _ = cv2.getTextSize(footer, font, footer_scale, 1)
+                    cv2.putText(
+                        annotated_frame,
+                        footer,
+                        ((width - footer_size[0]) // 2, height - footer_height // 2 + footer_size[1] // 2),
+                        font,
+                        footer_scale,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+                    render_width = max(1, screen_width * resolution_percent // 100)
+                    render_height = max(1, screen_height * resolution_percent // 100)
+                    render_frame = cv2.resize(
+                        annotated_frame,
+                        (render_width, render_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    if resolution_percent < 100:
+                        render_frame = cv2.resize(
+                            render_frame,
+                            (screen_width, screen_height),
+                            interpolation=cv2.INTER_NEAREST,
                         )
+                    cv2.imshow(window_name, render_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord('q'), ord('Q')):
+                        break
+                    if key in (ord('w'), ord('W')):
+                        resolution_percent = min(100, resolution_percent + 10)
+                    elif key in (ord('e'), ord('E')):
+                        resolution_percent = max(10, resolution_percent - 10)
+        finally:
+            self.cap.release()
+            cv2.destroyAllWindows()
 
-                annotated_frame = self.overlay_handshape(annotated_frame, pred_right[0], position=(20, 50))
-                annotated_frame = self.overlay_handshape(annotated_frame, pred_left[0], position=(20, 200))
-
-                hidden_plot_size = (350, 150)
-                hidden_plot_right = self.plot_hidden_representation(self.saved_frames_hidrep_right.stack_and_get(), size=hidden_plot_size)
-                hidden_plot_left = self.plot_hidden_representation(self.saved_frames_hidrep_left.stack_and_get(), size=hidden_plot_size)
-
-                annotated_frame[50:200, 900:1250] = cv2.resize(hidden_plot_right, hidden_plot_size)
-                annotated_frame[220:370, 900:1250] = cv2.resize(hidden_plot_left, hidden_plot_size)
-
-                # Display the frame
-                cv2.imshow("Hand Detection with Overlays", annotated_frame)
-
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-        self.cap.release()
-        cv2.destroyAllWindows()
-
-if __name__ == '__main__':
+def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # device = torch.device('cpu')
-    criterion = nn.CrossEntropyLoss()
     model = LinearHandshapePredictor(
         input_dim=in_dim, 
         enc_lat_dims=enc_lat_dims, 
@@ -275,21 +356,15 @@ if __name__ == '__main__':
         dec_lat_dims=dec_lat_dims, 
         output_dim=out_dim
     )
-    model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-    ts = "1113174414-lin"
-    stop_epoch = "597"
-    # save_subdir = os.path.join(model_save_dir, "{}/".format(ts))
-    save_subdir = "./"
-    model_raw_name = f"{stop_epoch}"
-    model_name = model_raw_name + ".pt"
-    model_path = os.path.join(save_subdir, model_name)
-    state = torch.load(model_path)
+    model_path = Path(__file__).resolve().parent / "597.pt"
+    state = torch.load(model_path, map_location="cpu")
     model.load_state_dict(state)
     model.to(device)
     model.eval()
 
-    video_path = "./B_01_079-NOTHING-0KC7-67.mp4"
-    detector = HandDetection(video_path=video_path)
+    video_path = Path(__file__).resolve().parent / "B_01_079-NOTHING-0KC7-67.mp4"
+    detector = HandDetection(model=model, video_path=video_path)
     detector.detect()
+
+if __name__ == '__main__':
+    main()

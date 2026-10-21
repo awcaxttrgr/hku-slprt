@@ -186,23 +186,7 @@ class HandshapeVideoLookup:
         self.offset = 0
         self.window_started_at = None
         self.animations = {}
-        self.font_path = self._find_cjk_font()
-
-    @staticmethod
-    def _find_cjk_font():
-        windows_fonts = Path("C:/Windows/Fonts")
-        font_candidates = (
-            windows_fonts / "msjh.ttc",
-            windows_fonts / "mingliu.ttc",
-            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-        )
-        for font_path in font_candidates:
-            if font_path.is_file():
-                return font_path
-        raise FileNotFoundError(
-            "No CJK font found."
-        )
+        self.font_dir = Path(__file__).resolve().parent / "fonts"
 
     def _matching_entries(self, right_codepoint, left_codepoint):
         matches = []
@@ -338,12 +322,26 @@ class HandshapeVideoLookup:
         base = Image.alpha_composite(base, overlay)
         draw = ImageDraw.Draw(base)
         font_size = max(11, screen_width // 150)
-        font = ImageFont.truetype(str(self.font_path), font_size)
+        latin_font = ImageFont.truetype(
+            str(self.font_dir / "PublicSans-Regular.ttf"),
+            font_size,
+        )
+        cjk_font = ImageFont.truetype(
+            str(self.font_dir / "GenKiGothic2TW-R.otf"), font_size
+        )
+        digit_width = max(
+            latin_font.getlength(str(digit)) for digit in range(10)
+        )
         line_height = font_size + max(2, font_size // 4)
         inner_width = max(1, panel_width - 2 * margin)
 
         if not visible:
-            draw.text((margin, margin), "No matching signs", font=font, fill="white")
+            draw.text(
+                (margin, margin),
+                "No matching signs",
+                font=latin_font,
+                fill="white",
+            )
         else:
             for index, (_, entry_id, entry, _) in enumerate(visible):
                 card_top = margin + index * (card_height + margin)
@@ -366,19 +364,47 @@ class HandshapeVideoLookup:
                 for text in translation_lines(entry):
                     if text:
                         lines.extend(
-                            self._wrap_text(text, font, draw, inner_width)
+                            self._wrap_text(
+                                text,
+                                cjk_font,
+                                draw,
+                                max(1, inner_width - digit_width),
+                            )
                         )
                 for line in lines:
                     if text_top + line_height > min(
                         screen_height, card_top + card_height
                     ):
                         break
-                    draw.text(
-                        (margin, text_top),
-                        line,
-                        font=font,
-                        fill=(255, 255, 255, 255),
-                    )
+                    text_x = margin
+                    for character in line:
+                        codepoint = ord(character)
+                        is_cjk = (
+                            0x2E80 <= codepoint <= 0xA4CF
+                            or 0xF900 <= codepoint <= 0xFAFF
+                            or 0xFE30 <= codepoint <= 0xFE4F
+                            or 0xFF00 <= codepoint <= 0xFFEF
+                            or codepoint >= 0x20000
+                        )
+                        font = cjk_font if is_cjk else latin_font
+                        draw.text(
+                            (
+                                text_x + (digit_width - latin_font.getlength(character)) / 2
+                                if character.isdigit()
+                                else text_x,
+                                text_top,
+                            ),
+                            character,
+                            font=font,
+                            fill=(255, 255, 255, 255),
+                        )
+                        text_x += (
+                            digit_width
+                            if character.isdigit()
+                            else draw.textlength(character, font=font)
+                        )
+                        if text_x + width > margin + inner_width:
+                            break
                     text_top += line_height
 
         rgb_frame = np.asarray(base.convert("RGB"))

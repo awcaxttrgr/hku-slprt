@@ -1,9 +1,13 @@
-import cv2
-import mediapipe as mp
+import json
+import time
 from collections import deque
 from pathlib import Path
+
+import cv2
+import mediapipe as mp
 from google.protobuf.json_format import MessageToDict
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 import torch
 
@@ -87,6 +91,300 @@ def model_predict(model, features, hsdict):
     hid_rep = hid_rep.cpu().numpy()
     return hid_rep, pred
 
+
+def parse_codepoint_pairs(notation):
+    pairs = []
+    for group in notation.replace(".", ",").split(","):
+        values = [int(value) for value in group.split(";") if value]
+        for index in range(0, len(values), 2):
+            dominant = values[index]
+            non_dominant = values[index + 1] if index + 1 < len(values) else 0
+            pairs.append((dominant, non_dominant))
+    return pairs
+
+
+def format_lookup_value(value):
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def translation_lines(entry):
+    translations = entry.get("translation") or {}
+    zh_yue = translations.get("ZH-Yue")
+    zh_hk = translations.get("ZH-HK") or {}
+    if zh_yue is None:
+        zh_yue = zh_hk
+
+    def value(language, key, fallback=None):
+        if key in language:
+            return format_lookup_value(language.get(key))
+        return format_lookup_value(fallback.get(key)) if fallback else ""
+
+    cantonese_primary = value(zh_yue, "primary", zh_hk)
+    cantonese_secondary = value(zh_yue, "secondary", zh_hk)
+    disambiguation = format_lookup_value(zh_hk.get("disambiguation"))
+    cantonese = [cantonese_primary]
+    if disambiguation:
+        cantonese.append(f"({disambiguation})")
+    cantonese.append(cantonese_secondary)
+
+    english = translations.get("EN-GB") or {}
+    english_primary = format_lookup_value(english.get("primary"))
+    english_disambiguation = format_lookup_value(english.get("disambiguation"))
+    english_secondary = format_lookup_value(english.get("secondary"))
+    english_line = [english_primary]
+    if english_disambiguation:
+        english_line.append(f"({english_disambiguation})")
+    english_line.append(english_secondary)
+
+    entry_id = format_lookup_value(
+        (entry.get("HKU_HKSLLEX_ID") or {}).get("id")
+    )
+    return [
+        " ".join(part for part in cantonese if part),
+        " ".join(part for part in english_line if part),
+        entry_id,
+    ]
+
+
+class AnimatedWebP:
+    def __init__(self, path):
+        self.path = path
+        self.frames = []
+        self.durations = []
+        with Image.open(path) as webp:
+            for frame_index in range(getattr(webp, "n_frames", 1)):
+                webp.seek(frame_index)
+                self.frames.append(webp.convert("RGBA").copy())
+                duration = max(10, int(webp.info.get("duration", 100))) / 1000
+                self.durations.append(duration)
+
+        if not self.frames:
+            raise ValueError(f"WebP contains no frames: {path}")
+
+        self.loop_duration = sum(self.durations)
+        self.started_at = time.monotonic()
+
+    def frame_at(self, now):
+        position = (now - self.started_at) % self.loop_duration
+        for frame, duration in zip(self.frames, self.durations):
+            if position < duration:
+                return frame
+            position -= duration
+        return self.frames[-1]
+
+
+class HandshapeVideoLookup:
+    def __init__(self, database_dir):
+        self.video_dir = database_dir / "webp"
+        with (database_dir / "data.json").open(encoding="utf-8") as data_file:
+            self.entries = json.load(data_file)
+        self.matches = []
+        self.offset = 0
+        self.window_started_at = None
+        self.animations = {}
+        self.font_path = self._find_cjk_font()
+
+    @staticmethod
+    def _find_cjk_font():
+        windows_fonts = Path("C:/Windows/Fonts")
+        font_candidates = (
+            windows_fonts / "msjh.ttc",
+            windows_fonts / "mingliu.ttc",
+            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+        )
+        for font_path in font_candidates:
+            if font_path.is_file():
+                return font_path
+        raise FileNotFoundError(
+            "No CJK font found."
+        )
+
+    def _matching_entries(self, right_codepoint, left_codepoint):
+        matches = []
+        for entry in self.entries:
+            record = entry.get("HKU_HKSLLEX_ID") or {}
+            if record.get("status") == "under_review":
+                continue
+
+            notation = (entry.get("cuhkcslds_HandshapeFont") or {}).get(
+                "CodepointNotation"
+            )
+            if not notation:
+                continue
+
+            best_rank = None
+            for pair_index, (dominant, non_dominant) in enumerate(
+                parse_codepoint_pairs(notation)
+            ):
+                rank = None
+                if (
+                    right_codepoint is not None
+                    and left_codepoint is not None
+                    and dominant != 0
+                    and non_dominant != 0
+                    and (
+                        (
+                            right_codepoint == dominant
+                            and left_codepoint == non_dominant
+                        )
+                        or (
+                            left_codepoint == dominant
+                            and right_codepoint == non_dominant
+                        )
+                    )
+                ):
+                    rank = 0
+                elif dominant != 0 and dominant in (
+                    right_codepoint,
+                    left_codepoint,
+                ):
+                    rank = 1
+                elif right_codepoint in (dominant, non_dominant):
+                    rank = 2
+
+                if rank is not None:
+                    candidate_rank = (pair_index, rank)
+                    if best_rank is None or candidate_rank < best_rank:
+                        best_rank = candidate_rank
+
+            if best_rank is None:
+                continue
+
+            video_name = (entry.get("videoFile") or {}).get("nameGIF")
+            if not video_name:
+                continue
+            video_path = self.video_dir / Path(video_name).name
+            if not video_path.is_file():
+                print(f"Matching WebP not found: {video_path}")
+                continue
+            matches.append((best_rank, record.get("id", ""), entry, video_path))
+
+        matches.sort(key=lambda match: (match[0], match[1]))
+        return matches
+
+    def update(self, right_codepoint, left_codepoint):
+        matches = self._matching_entries(right_codepoint, left_codepoint)
+        if [match[1] for match in matches] == [match[1] for match in self.matches]:
+            return
+
+        self.matches = matches
+        self.offset = 0
+        self._keep_visible_animations()
+        self.window_started_at = time.monotonic() if matches else None
+        if matches:
+            self.animations[matches[0][1]].started_at = self.window_started_at
+
+    def _keep_visible_animations(self):
+        visible = self.matches[self.offset:self.offset + 3]
+        active_ids = {match[1] for match in visible}
+        self.animations = {
+            entry_id: animation
+            for entry_id, animation in self.animations.items()
+            if entry_id in active_ids
+        }
+        for _, entry_id, _, video_path in visible:
+            if entry_id not in self.animations:
+                self.animations[entry_id] = AnimatedWebP(video_path)
+
+    def visible_matches(self, now):
+        if not self.matches:
+            return []
+
+        lead = self.matches[self.offset]
+        lead_animation = self.animations[lead[1]]
+        if (
+            self.offset < len(self.matches) - 1
+            and self.window_started_at is not None
+            and now - self.window_started_at >= lead_animation.loop_duration
+        ):
+            self.offset += 1
+            self._keep_visible_animations()
+            self.window_started_at = time.monotonic()
+            self.animations[self.matches[self.offset][1]].started_at = (
+                self.window_started_at
+            )
+        return self.matches[self.offset:self.offset + 3]
+
+    @staticmethod
+    def _wrap_text(text, font, draw, max_width):
+        lines = []
+        current = ""
+        for character in text:
+            candidate = current + character
+            if current and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+                lines.append(current)
+                current = character
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines
+
+    def render_sidebar(self, frame, screen_width, screen_height):
+        now = time.monotonic()
+        visible = self.visible_matches(now)
+        panel_width = max(1, round(screen_width * 0.15))
+        margin = max(4, panel_width // 24)
+        card_height = max(1, (screen_height - 4 * margin) // 3)
+        base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        draw.rectangle((0, 0, panel_width, screen_height), fill=(8, 8, 8, 225))
+        base = Image.alpha_composite(base, overlay)
+        draw = ImageDraw.Draw(base)
+        font_size = max(11, screen_width // 150)
+        font = ImageFont.truetype(str(self.font_path), font_size)
+        line_height = font_size + max(2, font_size // 4)
+        inner_width = max(1, panel_width - 2 * margin)
+
+        if not visible:
+            draw.text((margin, margin), "No matching signs", font=font, fill="white")
+        else:
+            for index, (_, entry_id, entry, _) in enumerate(visible):
+                card_top = margin + index * (card_height + margin)
+                video_box_height = int(card_height * 0.58)
+                animation = self.animations[entry_id]
+                source_frame = animation.frame_at(now)
+                scale = min(
+                    panel_width / source_frame.width,
+                    video_box_height / source_frame.height,
+                )
+                video_size = (
+                    max(1, round(source_frame.width * scale)),
+                    max(1, round(source_frame.height * scale)),
+                )
+                video = source_frame.resize(video_size, Image.Resampling.LANCZOS)
+                base.alpha_composite(video, (0, card_top))
+
+                text_top = card_top + video_box_height + margin
+                lines = []
+                for text in translation_lines(entry):
+                    if text:
+                        lines.extend(
+                            self._wrap_text(text, font, draw, inner_width)
+                        )
+                for line in lines:
+                    if text_top + line_height > min(
+                        screen_height, card_top + card_height
+                    ):
+                        break
+                    draw.text(
+                        (margin, text_top),
+                        line,
+                        font=font,
+                        fill=(255, 255, 255, 255),
+                    )
+                    text_top += line_height
+
+        rgb_frame = np.asarray(base.convert("RGB"))
+        return cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+
+
 class ListBuffer: 
     def __init__(self, buffer_size) -> None:
         self.buffer = deque(maxlen=buffer_size)
@@ -103,6 +401,12 @@ class HandDetection:
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
         self.handshape_dir = Path(__file__).resolve().parent / "hs_char"
+        self.lookup = HandshapeVideoLookup(
+            Path(__file__).resolve().parent / "database"
+        )
+        self.pending_handshapes = None
+        self.pending_handshapes_since = None
+        self.active_handshapes = None
         self.handshape_images = {}
         self.missing_handshape_images = set()
         self.saved_frames_hidrep_right = ListBuffer(10)
@@ -232,6 +536,26 @@ class HandDetection:
                     self.saved_frames_hidrep_right.append(hid_rep_right[0])
                     self.saved_frames_hidrep_left.append(hid_rep_left[0])
 
+                    observed_handshapes = (
+                        ord(pred_right[0]) if right_lm["flag"] == FLAG_OK else None,
+                        ord(pred_left[0]) if left_lm["flag"] == FLAG_OK else None,
+                    )
+                    if observed_handshapes == (None, None):
+                        self.pending_handshapes = None
+                        self.pending_handshapes_since = None
+                    else:
+                        now = time.monotonic()
+                        if observed_handshapes != self.pending_handshapes:
+                            self.pending_handshapes = observed_handshapes
+                            self.pending_handshapes_since = now
+                        elif (
+                            self.pending_handshapes_since is not None
+                            and now - self.pending_handshapes_since >= 1
+                            and observed_handshapes != self.active_handshapes
+                        ):
+                            self.active_handshapes = observed_handshapes
+                            self.lookup.update(*observed_handshapes)
+
                     annotated_frame = cv2.flip(frame.copy(), 1)
                     if results.multi_hand_landmarks:
                         for hand_landmarks in results.multi_hand_landmarks:
@@ -335,6 +659,9 @@ class HandDetection:
                             (screen_width, screen_height),
                             interpolation=cv2.INTER_NEAREST,
                         )
+                    render_frame = self.lookup.render_sidebar(
+                        render_frame, screen_width, screen_height
+                    )
                     cv2.imshow(window_name, render_frame)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord('q'), ord('Q')):

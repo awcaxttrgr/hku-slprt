@@ -6,6 +6,8 @@ On Windows, double-click [`run_demo.bat`](./run_demo.bat). If Conda is unavailab
 
 Handshape images belong in `hs_char` and must be named `<three-digit decimal Unicode codepoint>.png` (for example, `A` uses `065.png`). Characters remain the internal prediction labels.
 
+After a handshape stays recognized for one second, the left sidebar shows matching entries from `database/data.json` with their `database/webp` videos and translations. Matches prioritize earlier handshape pairs, then two-hand, dominant-hand, and right-hand matches. Videos loop; the three-entry window advances after each lead video completes a loop. A system CJK font (Microsoft YaHei, SimHei, MingLiU, or Noto Sans CJK) is required for translation text.
+
 ## How to run through the codes
 1. run paths.py
 2. put the videos under src/vid/xxx/

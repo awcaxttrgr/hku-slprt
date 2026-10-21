@@ -1,3 +1,7 @@
+~$*.*
+copylist.txt
+copy.bat
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -48,3 +52,10 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+
+database/webp/copylist.txt
+database/webp/copy.bat
+.gitignore
+database/~$data.xlsx
+database/mark_missing_videos_under_review.ps1

@@ -6,7 +6,7 @@ On Windows, double-click [`run_demo.bat`](./run_demo.bat). If Conda is unavailab
 
 Handshape images belong in `hs_char` and must be named `<three-digit decimal Unicode codepoint>.png` (for example, `A` uses `065.png`). Characters remain the internal prediction labels.
 
-After a handshape stays recognized for one second, the left sidebar shows matching entries from `database/data.json` with their `database/webp` videos and translations. Matches prioritize earlier handshape pairs, then two-hand, dominant-hand, and right-hand matches. Videos loop; the three-entry window advances after each lead video completes a loop. Translation text uses bundled Public Sans and GenKiGothic2TW fonts; the system does not need extra fonts installed.
+After a handshape stays recognized for one second, the left sidebar shows matching entries from `database/data.json` with their `database/webp` videos and translations. Missing-hand indicators use `000.png`; indicators sit side by side above the videos, left hand on the left and right hand on the right. A horizontal bar shows recognition delay. Matches prioritize earlier handshape pairs, then two-hand, dominant-hand, and right-hand matches. Videos loop; the three-entry window advances after each lead video completes a loop. Total match count includes all results; videos load in batches of 12, with the next batch loaded when the visible window reaches the last 2 videos. The sidebar shows remaining matches. All rendered text uses bundled Public Sans and GenKiGothic2TW fonts; Cantonese captions are larger, IDs smaller, and digits use tabular spacing.
 
 ## How to run through the codes
 1. run paths.py

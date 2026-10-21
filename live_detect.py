@@ -184,9 +184,30 @@ class HandshapeVideoLookup:
             self.entries = json.load(data_file)
         self.matches = []
         self.offset = 0
+        self.loaded_until = 0
         self.window_started_at = None
         self.animations = {}
         self.font_dir = Path(__file__).resolve().parent / "fonts"
+        self.font_cache = {}
+        self.digit_width_cache = {}
+        self.handshape_timeout_started_at = None
+        self.handshape_timeout_duration = 1.0
+
+    def get_font(self, filename, size):
+        key = (filename, size)
+        if key not in self.font_cache:
+            self.font_cache[key] = ImageFont.truetype(
+                str(self.font_dir / filename), size
+            )
+        return self.font_cache[key]
+
+    def digit_width(self, font):
+        key = (font.getname(), font.size)
+        if key not in self.digit_width_cache:
+            self.digit_width_cache[key] = max(
+                font.getlength(str(digit)) for digit in range(10)
+            )
+        return self.digit_width_cache[key]
 
     def _matching_entries(self, right_codepoint, left_codepoint):
         matches = []
@@ -258,13 +279,18 @@ class HandshapeVideoLookup:
 
         self.matches = matches
         self.offset = 0
+        self.loaded_until = min(12, len(matches))
         self._keep_visible_animations()
         self.window_started_at = time.monotonic() if matches else None
         if matches:
             self.animations[matches[0][1]].started_at = self.window_started_at
 
+    def update_handshape_timeout(self, started_at, duration=1.0):
+        self.handshape_timeout_started_at = started_at
+        self.handshape_timeout_duration = duration
+
     def _keep_visible_animations(self):
-        visible = self.matches[self.offset:self.offset + 3]
+        visible = self.matches[self.offset:min(self.offset + 3, self.loaded_until)]
         active_ids = {match[1] for match in visible}
         self.animations = {
             entry_id: animation
@@ -279,6 +305,12 @@ class HandshapeVideoLookup:
         if not self.matches:
             return []
 
+        if (
+            self.loaded_until < len(self.matches)
+            and self.offset + 3 >= self.loaded_until
+        ):
+            self.loaded_until = min(self.loaded_until + 12, len(self.matches))
+
         lead = self.matches[self.offset]
         lead_animation = self.animations[lead[1]]
         if (
@@ -292,15 +324,16 @@ class HandshapeVideoLookup:
             self.animations[self.matches[self.offset][1]].started_at = (
                 self.window_started_at
             )
-        return self.matches[self.offset:self.offset + 3]
+        return self.matches[self.offset:min(self.offset + 3, self.loaded_until)]
 
-    @staticmethod
-    def _wrap_text(text, font, draw, max_width):
+    def _wrap_text(self, text, draw, max_width, latin_font, cjk_font):
         lines = []
         current = ""
         for character in text:
             candidate = current + character
-            if current and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+            if current and self._text_width(
+                candidate, draw, latin_font, cjk_font
+            ) > max_width:
                 lines.append(current)
                 current = character
             else:
@@ -309,43 +342,156 @@ class HandshapeVideoLookup:
             lines.append(current)
         return lines
 
+    @staticmethod
+    def _is_cjk(character):
+        codepoint = ord(character)
+        return (
+            0x2E80 <= codepoint <= 0xA4CF
+            or 0xF900 <= codepoint <= 0xFAFF
+            or 0xFE30 <= codepoint <= 0xFE4F
+            or 0xFF00 <= codepoint <= 0xFFEF
+            or codepoint >= 0x20000
+        )
+
+    def _text_width(self, text, draw, latin_font, cjk_font):
+        digit_width = self.digit_width(latin_font)
+        return sum(
+            digit_width
+            if character.isdigit()
+            else draw.textlength(
+                character,
+                font=cjk_font if self._is_cjk(character) else latin_font,
+            )
+            for character in text
+        )
+
+    def _draw_text(self, draw, text, position, latin_font, cjk_font, fill):
+        digit_width = self.digit_width(latin_font)
+        text_x, text_y = position
+        for character in text:
+            is_digit = character.isdigit()
+            font = cjk_font if self._is_cjk(character) else latin_font
+            draw.text(
+                (
+                    text_x + (digit_width - latin_font.getlength(character)) / 2
+                    if is_digit
+                    else text_x,
+                    text_y,
+                ),
+                character,
+                font=font,
+                fill=fill,
+            )
+            text_x += (
+                digit_width
+                if is_digit
+                else draw.textlength(character, font=font)
+            )
+        return text_x - position[0]
+
+    @staticmethod
+    def indicator_layout(screen_width):
+        panel_width = max(1, round(screen_width * 0.15))
+        margin = max(4, panel_width // 24)
+        gap = max(4, margin // 2)
+        size = max(18, (panel_width - 2 * margin - gap - 20) // 2)
+        return panel_width, margin, gap, size, size + 2 * margin
+
     def render_sidebar(self, frame, screen_width, screen_height):
         now = time.monotonic()
         visible = self.visible_matches(now)
-        panel_width = max(1, round(screen_width * 0.15))
-        margin = max(4, panel_width // 24)
-        card_height = max(1, (screen_height - 4 * margin) // 3)
+        panel_width, margin, _, _, header_height = self.indicator_layout(
+            screen_width
+        )
+        footer_height = max(24, screen_height // 30)
+        content_top = header_height
+        content_height = max(1, screen_height - header_height - footer_height)
+        card_height = max(1, (content_height - 4 * margin) // 3)
         base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         draw.rectangle((0, 0, panel_width, screen_height), fill=(8, 8, 8, 225))
+        timeout_start = self.handshape_timeout_started_at
+        if timeout_start is not None:
+            progress = min(
+                1.0,
+                max(
+                    0.0,
+                    (now - timeout_start) / self.handshape_timeout_duration,
+                ),
+            )
+            bar_y = header_height - max(3, margin // 2) + max(6, margin // 2)
+            bar_left = margin
+            bar_right = panel_width - margin
+            draw.rectangle(
+                (bar_left, bar_y, bar_right, bar_y + 3),
+                fill=(90, 90, 90, 255),
+            )
+            draw.rectangle(
+                (
+                    bar_left,
+                    bar_y,
+                    bar_left + round((bar_right - bar_left) * progress),
+                    bar_y + 3,
+                ),
+                fill=(80, 210, 120, 255),
+            )
         base = Image.alpha_composite(base, overlay)
         draw = ImageDraw.Draw(base)
         font_size = max(11, screen_width // 150)
-        latin_font = ImageFont.truetype(
-            str(self.font_dir / "PublicSans-Regular.ttf"),
-            font_size,
+        latin_font = self.get_font("PublicSans-Regular.ttf", font_size)
+        cjk_font = self.get_font("GenKiGothic2TW-R.otf", font_size)
+        caption_font_size = max(font_size + 4, screen_width // 100)
+        caption_latin_font = self.get_font(
+            "PublicSans-Regular.ttf", caption_font_size
         )
-        cjk_font = ImageFont.truetype(
-            str(self.font_dir / "GenKiGothic2TW-R.otf"), font_size
+        caption_cjk_font = self.get_font(
+            "GenKiGothic2TW-R.otf", caption_font_size
         )
-        digit_width = max(
-            latin_font.getlength(str(digit)) for digit in range(10)
+        cantonese_font_size = max(caption_font_size + 5, screen_width // 85)
+        cantonese_latin_font = self.get_font(
+            "PublicSans-Regular.ttf", cantonese_font_size
         )
-        line_height = font_size + max(2, font_size // 4)
+        cantonese_cjk_font = self.get_font(
+            "GenKiGothic2TW-R.otf", cantonese_font_size
+        )
+        id_font_size = max(10, font_size - 2)
+        id_latin_font = self.get_font("PublicSans-Regular.ttf", id_font_size)
+        id_cjk_font = self.get_font("GenKiGothic2TW-R.otf", id_font_size)
         inner_width = max(1, panel_width - 2 * margin)
 
+        draw = ImageDraw.Draw(base)
+        total_matches = len(self.matches)
+        shown_matches = min(3, total_matches - self.offset)
+        remaining_matches = max(0, total_matches - self.offset - shown_matches)
+        footer_text = (
+            f"{total_matches} matches  |  {remaining_matches} remaining"
+        )
+        footer_width = self._text_width(
+            footer_text, draw, latin_font, cjk_font
+        )
+        self._draw_text(
+            draw,
+            footer_text,
+            (max(0, (panel_width - footer_width) / 2), screen_height - footer_height),
+            latin_font,
+            cjk_font,
+            "white",
+        )
+
         if not visible:
-            draw.text(
-                (margin, margin),
+            self._draw_text(
+                draw,
                 "No matching signs",
-                font=latin_font,
-                fill="white",
+                (margin, content_top + margin),
+                latin_font,
+                cjk_font,
+                "white",
             )
         else:
             for index, (_, entry_id, entry, _) in enumerate(visible):
-                card_top = margin + index * (card_height + margin)
-                video_box_height = int(card_height * 0.58)
+                card_top = content_top + margin + index * (card_height + margin)
+                video_box_height = int(card_height * 0.54)
                 animation = self.animations[entry_id]
                 source_frame = animation.frame_at(now)
                 scale = min(
@@ -361,50 +507,44 @@ class HandshapeVideoLookup:
 
                 text_top = card_top + video_box_height + margin
                 lines = []
-                for text in translation_lines(entry):
+                translations = translation_lines(entry)
+                for translation_index, text in enumerate(translations):
                     if text:
+                        if translation_index == 0:
+                            text_latin_font = cantonese_latin_font
+                            text_cjk_font = cantonese_cjk_font
+                        elif translation_index == 2:
+                            text_latin_font = id_latin_font
+                            text_cjk_font = id_cjk_font
+                        else:
+                            text_latin_font = caption_latin_font
+                            text_cjk_font = caption_cjk_font
                         lines.extend(
-                            self._wrap_text(
-                                text,
-                                cjk_font,
-                                draw,
-                                max(1, inner_width - digit_width),
+                            (
+                                line,
+                                text_latin_font,
+                                text_cjk_font,
+                                text_latin_font.size
+                                + max(2, text_latin_font.size // 4),
+                            )
+                            for line in self._wrap_text(
+                                text, draw, inner_width,
+                                text_latin_font, text_cjk_font,
                             )
                         )
-                for line in lines:
+                for line, line_latin_font, line_cjk_font, line_height in lines:
                     if text_top + line_height > min(
                         screen_height, card_top + card_height
                     ):
                         break
-                    text_x = margin
-                    for character in line:
-                        codepoint = ord(character)
-                        is_cjk = (
-                            0x2E80 <= codepoint <= 0xA4CF
-                            or 0xF900 <= codepoint <= 0xFAFF
-                            or 0xFE30 <= codepoint <= 0xFE4F
-                            or 0xFF00 <= codepoint <= 0xFFEF
-                            or codepoint >= 0x20000
-                        )
-                        font = cjk_font if is_cjk else latin_font
-                        draw.text(
-                            (
-                                text_x + (digit_width - latin_font.getlength(character)) / 2
-                                if character.isdigit()
-                                else text_x,
-                                text_top,
-                            ),
-                            character,
-                            font=font,
-                            fill=(255, 255, 255, 255),
-                        )
-                        text_x += (
-                            digit_width
-                            if character.isdigit()
-                            else draw.textlength(character, font=font)
-                        )
-                        if text_x + width > margin + inner_width:
-                            break
+                    self._draw_text(
+                        draw,
+                        line,
+                        (margin, text_top),
+                        line_latin_font,
+                        line_cjk_font,
+                        (255, 255, 255, 255),
+                    )
                     text_top += line_height
 
         rgb_frame = np.asarray(base.convert("RGB"))
@@ -577,10 +717,14 @@ class HandDetection:
                         elif (
                             self.pending_handshapes_since is not None
                             and now - self.pending_handshapes_since >= 1
-                            and observed_handshapes != self.active_handshapes
                         ):
-                            self.active_handshapes = observed_handshapes
-                            self.lookup.update(*observed_handshapes)
+                            if observed_handshapes != self.active_handshapes:
+                                self.active_handshapes = observed_handshapes
+                                self.lookup.update(*observed_handshapes)
+                            self.pending_handshapes_since = None
+                    self.lookup.update_handshape_timeout(
+                        self.pending_handshapes_since
+                    )
 
                     annotated_frame = cv2.flip(frame.copy(), 1)
                     if results.multi_hand_landmarks:
@@ -595,20 +739,6 @@ class HandDetection:
 
                     height, width = annotated_frame.shape[:2]
                     banner_height = max(56, height // 12)
-                    result_margin = max(20, width // 40)
-                    result_size = (120, 120)
-                    result_gap = max(16, height // 40)
-                    result_x = result_margin
-                    result_y = banner_height + result_margin
-                    annotated_frame = self.overlay_handshape(
-                        annotated_frame, pred_right[0],
-                        position=(result_x, result_y), size=result_size,
-                    )
-                    annotated_frame = self.overlay_handshape(
-                        annotated_frame, pred_left[0],
-                        position=(result_x, result_y + result_size[1] + 10 + result_gap),
-                        size=result_size,
-                    )
 
                     hidden_plot_size = (350, 150)
                     hidden_plot_right = self.plot_hidden_representation(self.saved_frames_hidrep_right.stack_and_get(), size=hidden_plot_size)
@@ -640,36 +770,51 @@ class HandDetection:
                     cv2.addWeighted(overlay, 0.65, annotated_frame, 0.35, 0, annotated_frame)
 
                     title = "HKU Linguistics: HKSL Handshape Detection Model Demonstration"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    title_scale = min(0.9, (width - 40) / max(
-                        cv2.getTextSize(title, font, 1.0, 2)[0][0], 1
-                    ))
-                    title_size, _ = cv2.getTextSize(title, font, title_scale, 2)
-                    title_x = max((width - title_size[0]) // 2, 10)
-                    cv2.putText(
-                        annotated_frame,
-                        title,
-                        (title_x, banner_height // 2 + title_size[1] // 2),
-                        font,
-                        title_scale,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
                     footer = (
                         f"[W] +10%  [E] -10%  Resolution: {resolution_percent}%  [Q] Quit"
                     )
-                    footer_scale = 0.6
-                    footer_size, _ = cv2.getTextSize(footer, font, footer_scale, 1)
-                    cv2.putText(
-                        annotated_frame,
-                        footer,
-                        ((width - footer_size[0]) // 2, height - footer_height // 2 + footer_size[1] // 2),
-                        font,
-                        footer_scale,
+                    text_image = Image.fromarray(
+                        cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                    )
+                    text_draw = ImageDraw.Draw(text_image)
+                    title_font_size = min(42, max(18, banner_height // 2))
+                    title_font = self.lookup.get_font(
+                        "PublicSans-Regular.ttf", title_font_size
+                    )
+                    title_cjk_font = self.lookup.get_font(
+                        "GenKiGothic2TW-R.otf", title_font_size
+                    )
+                    footer_font_size = max(14, footer_height // 3)
+                    footer_font = self.lookup.get_font(
+                        "PublicSans-Regular.ttf", footer_font_size
+                    )
+                    footer_cjk_font = self.lookup.get_font(
+                        "GenKiGothic2TW-R.otf", footer_font_size
+                    )
+                    title_width = self.lookup._text_width(
+                        title, text_draw, title_font, title_cjk_font
+                    )
+                    footer_width = self.lookup._text_width(
+                        footer, text_draw, footer_font, footer_cjk_font
+                    )
+                    self.lookup._draw_text(
+                        text_draw,
+                        title,
+                        (max(10, (width - title_width) // 2), (banner_height - title_font_size) // 2),
+                        title_font,
+                        title_cjk_font,
                         (255, 255, 255),
-                        1,
-                        cv2.LINE_AA,
+                    )
+                    self.lookup._draw_text(
+                        text_draw,
+                        footer,
+                        (max(10, (width - footer_width) // 2), height - footer_height + (footer_height - footer_font_size) // 2),
+                        footer_font,
+                        footer_cjk_font,
+                        (255, 255, 255),
+                    )
+                    annotated_frame = cv2.cvtColor(
+                        np.asarray(text_image), cv2.COLOR_RGB2BGR
                     )
 
                     render_width = max(1, screen_width * resolution_percent // 100)
@@ -687,6 +832,29 @@ class HandDetection:
                         )
                     render_frame = self.lookup.render_sidebar(
                         render_frame, screen_width, screen_height
+                    )
+                    _, indicator_margin, indicator_gap, indicator_size, header_height = (
+                        self.lookup.indicator_layout(screen_width)
+                    )
+                    indicator_y = max(4, (header_height - indicator_size) // 2)
+                    render_frame = self.overlay_handshape(
+                        render_frame,
+                        pred_left[0]
+                        if left_lm["flag"] == FLAG_OK
+                        else chr(0),
+                        position=(indicator_margin, indicator_y),
+                        size=(indicator_size, indicator_size),
+                    )
+                    render_frame = self.overlay_handshape(
+                        render_frame,
+                        pred_right[0]
+                        if right_lm["flag"] == FLAG_OK
+                        else chr(0),
+                        position=(
+                            indicator_margin + indicator_size + 10 + indicator_gap,
+                            indicator_y,
+                        ),
+                        size=(indicator_size, indicator_size),
                     )
                     cv2.imshow(window_name, render_frame)
                     key = cv2.waitKey(1) & 0xFF

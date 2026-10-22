@@ -1,6 +1,9 @@
 import json
+import subprocess
+import sys
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -92,17 +95,6 @@ def model_predict(model, features, hsdict):
     return hid_rep, pred
 
 
-def parse_codepoint_pairs(notation):
-    pairs = []
-    for group in notation.replace(".", ",").split(","):
-        values = [int(value) for value in group.split(";") if value]
-        for index in range(0, len(values), 2):
-            dominant = values[index]
-            non_dominant = values[index + 1] if index + 1 < len(values) else 0
-            pairs.append((dominant, non_dominant))
-    return pairs
-
-
 def format_lookup_value(value):
     if isinstance(value, (list, tuple)):
         return ", ".join(str(item).strip() for item in value if str(item).strip())
@@ -141,7 +133,8 @@ def translation_lines(entry):
     english_line.append(english_secondary)
 
     entry_id = format_lookup_value(
-        (entry.get("HKU_HKSLLEX_ID") or {}).get("id")
+        entry.get("id")
+        or (entry.get("HKU_HKSLLEX_ID") or {}).get("id")
     )
     return [
         " ".join(part for part in cantonese if part),
@@ -151,16 +144,23 @@ def translation_lines(entry):
 
 
 class AnimatedWebP:
-    def __init__(self, path):
+    MAX_FRAME_SIZE = (240, 135)
+
+    def __init__(self, path, on_progress=None):
         self.path = path
         self.frames = []
         self.durations = []
         with Image.open(path) as webp:
-            for frame_index in range(getattr(webp, "n_frames", 1)):
+            frame_count = max(1, getattr(webp, "n_frames", 1))
+            for frame_index in range(frame_count):
                 webp.seek(frame_index)
-                self.frames.append(webp.convert("RGBA").copy())
+                frame = webp.convert("RGBA")
+                frame.thumbnail(self.MAX_FRAME_SIZE, Image.Resampling.LANCZOS)
+                self.frames.append(frame.copy())
                 duration = max(10, int(webp.info.get("duration", 100))) / 1000
                 self.durations.append(duration)
+                if on_progress is not None:
+                    on_progress((frame_index + 1) / frame_count)
 
         if not self.frames:
             raise ValueError(f"WebP contains no frames: {path}")
@@ -178,20 +178,61 @@ class AnimatedWebP:
 
 
 class HandshapeVideoLookup:
-    def __init__(self, database_dir):
+    LOOKUP_SCHEMA_VERSION = 5
+    PRECOMPUTED_RESULT_LIMIT = 12
+
+    def __init__(self, database_dir, batch_size=6):
         self.video_dir = database_dir / "webp"
-        with (database_dir / "data.json").open(encoding="utf-8") as data_file:
-            self.entries = json.load(data_file)
+        self.batch_size = batch_size
+        lookup_path = database_dir / "data.lookup.json"
+        builder_path = database_dir / "build_handshape_lookup.py"
+        source_path = database_dir / "data.json"
+        if (
+            not lookup_path.is_file()
+            or lookup_path.stat().st_mtime_ns < source_path.stat().st_mtime_ns
+        ):
+            subprocess.run(
+                [sys.executable, str(builder_path)],
+                check=True,
+                cwd=database_dir.parent,
+            )
+        with lookup_path.open(encoding="utf-8") as data_file:
+            lookup_data = json.load(data_file)
+        if lookup_data.get("schema_version") != self.LOOKUP_SCHEMA_VERSION:
+            subprocess.run(
+                [sys.executable, str(builder_path)],
+                check=True,
+                cwd=database_dir.parent,
+            )
+            with lookup_path.open(encoding="utf-8") as data_file:
+                lookup_data = json.load(data_file)
+        if lookup_data.get("schema_version") != self.LOOKUP_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported lookup index: {lookup_path}")
+        self.entries = lookup_data["entries"]
+        self.entry_by_video = {
+            entry["video"]: entry for entry in self.entries
+        }
+        self.by_codepoint = lookup_data["by_codepoint"]
+        self.precomputed = lookup_data["precomputed"]
         self.matches = []
         self.offset = 0
         self.loaded_until = 0
+        self.total_match_count = 0
         self.window_started_at = None
         self.animations = {}
+        self.video_load_progress = {}
+        self.query_key = None
+        self.continuation_future = None
+        self.loading_more = False
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="handshape-lookup"
+        )
+        self.video_executor = ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix="webp-loader"
+        )
         self.font_dir = Path(__file__).resolve().parent / "fonts"
         self.font_cache = {}
         self.digit_width_cache = {}
-        self.handshape_timeout_started_at = None
-        self.handshape_timeout_duration = 1.0
 
     def get_font(self, filename, size):
         key = (filename, size)
@@ -211,21 +252,17 @@ class HandshapeVideoLookup:
 
     def _matching_entries(self, right_codepoint, left_codepoint):
         matches = []
-        for entry in self.entries:
-            record = entry.get("HKU_HKSLLEX_ID") or {}
-            if record.get("status") == "under_review":
-                continue
+        candidate_indexes = set()
+        for codepoint in (right_codepoint, left_codepoint):
+            if codepoint is not None:
+                candidate_indexes.update(
+                    self.by_codepoint.get(str(codepoint), ())
+                )
 
-            notation = (entry.get("cuhkcslds_HandshapeFont") or {}).get(
-                "CodepointNotation"
-            )
-            if not notation:
-                continue
-
+        for entry_index in candidate_indexes:
+            entry = self.entries[entry_index]
             best_rank = None
-            for pair_index, (dominant, non_dominant) in enumerate(
-                parse_codepoint_pairs(notation)
-            ):
+            for pair_index, (dominant, non_dominant) in enumerate(entry["pairs"]):
                 rank = None
                 if (
                     right_codepoint is not None
@@ -249,7 +286,10 @@ class HandshapeVideoLookup:
                     left_codepoint,
                 ):
                     rank = 1
-                elif right_codepoint in (dominant, non_dominant):
+                elif non_dominant != 0 and non_dominant in (
+                    right_codepoint,
+                    left_codepoint,
+                ):
                     rank = 2
 
                 if rank is not None:
@@ -260,48 +300,143 @@ class HandshapeVideoLookup:
             if best_rank is None:
                 continue
 
-            video_name = (entry.get("videoFile") or {}).get("nameGIF")
-            if not video_name:
-                continue
-            video_path = self.video_dir / Path(video_name).name
-            if not video_path.is_file():
-                print(f"Matching WebP not found: {video_path}")
-                continue
-            matches.append((best_rank, record.get("id", ""), entry, video_path))
+            video_path = self.video_dir / entry["video"]
+            matches.append((best_rank, entry["id"], entry, video_path))
 
-        matches.sort(key=lambda match: (match[0], match[1]))
+        matches.sort(key=lambda match: (match[0], match[3].name))
         return matches
 
     def update(self, right_codepoint, left_codepoint):
-        matches = self._matching_entries(right_codepoint, left_codepoint)
-        if [match[1] for match in matches] == [match[1] for match in self.matches]:
+        query_key = self._query_key(right_codepoint, left_codepoint)
+        if query_key == self.query_key:
             return
 
-        self.matches = matches
+        if self.continuation_future is not None:
+            self.continuation_future.cancel()
+        self.continuation_future = None
+        self.loading_more = False
+        self.query_key = query_key
+        match_count, video_names = self.precomputed.get(query_key, (0, ()))
+        self.total_match_count = match_count
+        self.matches = self._make_matches(video_names)
         self.offset = 0
-        self.loaded_until = min(12, len(matches))
+        self.loaded_until = min(3, len(self.matches))
         self._keep_visible_animations()
-        self.window_started_at = time.monotonic() if matches else None
-        if matches:
-            self.animations[matches[0][1]].started_at = self.window_started_at
+        self.window_started_at = None
 
-    def update_handshape_timeout(self, started_at, duration=1.0):
-        self.handshape_timeout_started_at = started_at
-        self.handshape_timeout_duration = duration
+    def _make_matches(self, video_names):
+        self.matches = [
+            (
+                (0, 0),
+                self.entry_by_video[video_name]["id"],
+                self.entry_by_video[video_name],
+                self.video_dir / video_name,
+            )
+            for video_name in video_names
+        ]
+        return self.matches
+
+    @staticmethod
+    def _query_key(right_codepoint, left_codepoint):
+        right = "" if right_codepoint is None else str(right_codepoint)
+        left = "" if left_codepoint is None else str(left_codepoint)
+        return f"{right},{left}"
+
+    def _load_remaining_matches(
+        self,
+        right_codepoint,
+        left_codepoint,
+        first_batch_files,
+        expected_count,
+    ):
+        ranked_matches = self._matching_entries(right_codepoint, left_codepoint)
+        remaining = [
+            match for match in ranked_matches if match[3].name not in first_batch_files
+        ]
+        if len(remaining) + len(first_batch_files) != expected_count:
+            raise ValueError(
+                "Precomputed lookup count does not match indexed lookup results."
+            )
+        return remaining
+
+    def _start_remaining_lookup(self):
+        if self.continuation_future is not None or not self.query_key:
+            return
+        if len(self.matches) >= self.total_match_count:
+            return
+        right, left = self.query_key.split(",", maxsplit=1)
+        right_codepoint = int(right) if right else None
+        left_codepoint = int(left) if left else None
+        first_batch_files = {
+            match[3].name
+            for match in self.matches[:self.PRECOMPUTED_RESULT_LIMIT]
+        }
+        self.loading_more = True
+        self.continuation_future = self.executor.submit(
+            self._load_remaining_matches,
+            right_codepoint,
+            left_codepoint,
+            first_batch_files,
+            self.total_match_count,
+        )
+
+    def _finish_remaining_lookup(self):
+        future = self.continuation_future
+        if future is None or not future.done():
+            return
+        self.matches.extend(future.result())
+        self.continuation_future = None
+        self.loading_more = False
+
+    def close(self):
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.video_executor.shutdown(wait=False, cancel_futures=True)
+
+    def set_batch_size(self, batch_size):
+        if batch_size <= 0:
+            raise ValueError(f"Batch size must be positive: {batch_size}")
+        self.batch_size = batch_size
+        if self.matches:
+            self.loaded_until = min(
+                len(self.matches),
+                max(self.offset + 3, (self.offset // batch_size + 1) * batch_size),
+            )
 
     def _keep_visible_animations(self):
         visible = self.matches[self.offset:min(self.offset + 3, self.loaded_until)]
         active_ids = {match[1] for match in visible}
+        for entry_id, animation in self.animations.items():
+            if entry_id not in active_ids and isinstance(animation, Future):
+                animation.cancel()
         self.animations = {
             entry_id: animation
             for entry_id, animation in self.animations.items()
             if entry_id in active_ids
         }
+        self.video_load_progress = {
+            entry_id: progress
+            for entry_id, progress in self.video_load_progress.items()
+            if entry_id in active_ids
+        }
         for _, entry_id, _, video_path in visible:
-            if entry_id not in self.animations:
-                self.animations[entry_id] = AnimatedWebP(video_path)
+            animation = self.animations.get(entry_id)
+            if isinstance(animation, Future):
+                if animation.done():
+                    self.animations[entry_id] = animation.result()
+                    self.video_load_progress.pop(entry_id, None)
+            elif animation is None:
+                progress_state = [0.0]
+                self.video_load_progress[entry_id] = progress_state
+                self.animations[entry_id] = self.video_executor.submit(
+                    AnimatedWebP,
+                    video_path,
+                    lambda progress, state=progress_state: state.__setitem__(
+                        0, progress
+                    ),
+                )
 
     def visible_matches(self, now):
+        self._finish_remaining_lookup()
         if not self.matches:
             return []
 
@@ -309,21 +444,41 @@ class HandshapeVideoLookup:
             self.loaded_until < len(self.matches)
             and self.offset + 3 >= self.loaded_until
         ):
-            self.loaded_until = min(self.loaded_until + 12, len(self.matches))
+            self.loaded_until = min(
+                self.loaded_until + self.batch_size, len(self.matches)
+            )
+        self._keep_visible_animations()
 
         lead = self.matches[self.offset]
-        lead_animation = self.animations[lead[1]]
+        lead_animation = self.animations.get(lead[1])
+        if isinstance(lead_animation, Future):
+            if not lead_animation.done():
+                return self.matches[
+                    self.offset:min(self.offset + 3, self.loaded_until)
+                ]
+            lead_animation = lead_animation.result()
+            self.animations[lead[1]] = lead_animation
+        if not isinstance(lead_animation, AnimatedWebP):
+            return self.matches[
+                self.offset:min(self.offset + 3, self.loaded_until)
+            ]
+        if self.window_started_at is None:
+            self.window_started_at = now
+            lead_animation.started_at = now
         if (
-            self.offset < len(self.matches) - 1
+            self.offset >= self.PRECOMPUTED_RESULT_LIMIT - 1
+            and self.total_match_count > self.PRECOMPUTED_RESULT_LIMIT
+        ):
+            self._start_remaining_lookup()
+        if (
+            self.offset < self.total_match_count - 1
+            and self.offset < len(self.matches) - 1
             and self.window_started_at is not None
             and now - self.window_started_at >= lead_animation.loop_duration
         ):
             self.offset += 1
             self._keep_visible_animations()
-            self.window_started_at = time.monotonic()
-            self.animations[self.matches[self.offset][1]].started_at = (
-                self.window_started_at
-            )
+            self.window_started_at = None
         return self.matches[self.offset:min(self.offset + 3, self.loaded_until)]
 
     def _wrap_text(self, text, draw, max_width, latin_font, cjk_font):
@@ -404,43 +559,35 @@ class HandshapeVideoLookup:
             screen_width
         )
         footer_height = max(24, screen_height // 30)
-        content_top = header_height
-        content_height = max(1, screen_height - header_height - footer_height)
-        card_height = max(1, (content_height - 4 * margin) // 3)
+        status_lines = []
+        status_height = 0
         base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         draw.rectangle((0, 0, panel_width, screen_height), fill=(8, 8, 8, 225))
-        timeout_start = self.handshape_timeout_started_at
-        if timeout_start is not None:
-            progress = min(
-                1.0,
-                max(
-                    0.0,
-                    (now - timeout_start) / self.handshape_timeout_duration,
-                ),
-            )
-            bar_y = header_height - max(3, margin // 2) + max(6, margin // 2)
-            bar_left = margin
-            bar_right = panel_width - margin
-            draw.rectangle(
-                (bar_left, bar_y, bar_right, bar_y + 3),
-                fill=(90, 90, 90, 255),
-            )
-            draw.rectangle(
-                (
-                    bar_left,
-                    bar_y,
-                    bar_left + round((bar_right - bar_left) * progress),
-                    bar_y + 3,
-                ),
-                fill=(80, 210, 120, 255),
-            )
         base = Image.alpha_composite(base, overlay)
         draw = ImageDraw.Draw(base)
         font_size = max(11, screen_width // 150)
         latin_font = self.get_font("PublicSans-Regular.ttf", font_size)
         cjk_font = self.get_font("GenKiGothic2TW-R.otf", font_size)
+        inner_width = max(1, panel_width - 2 * margin)
+        if self.loading_more:
+            status_lines = self._wrap_text(
+                "Looking up full matches...",
+                draw,
+                inner_width,
+                latin_font,
+                cjk_font,
+            )
+            status_top = header_height + margin
+            status_height = margin + len(status_lines) * (font_size + 2)
+        else:
+            status_top = header_height
+        content_top = header_height + status_height
+        content_height = max(
+            1, screen_height - content_top - footer_height
+        )
+        card_height = max(1, (content_height - 4 * margin) // 3)
         caption_font_size = max(font_size + 4, screen_width // 100)
         caption_latin_font = self.get_font(
             "PublicSans-Regular.ttf", caption_font_size
@@ -458,14 +605,24 @@ class HandshapeVideoLookup:
         id_font_size = max(10, font_size - 2)
         id_latin_font = self.get_font("PublicSans-Regular.ttf", id_font_size)
         id_cjk_font = self.get_font("GenKiGothic2TW-R.otf", id_font_size)
-        inner_width = max(1, panel_width - 2 * margin)
-
         draw = ImageDraw.Draw(base)
-        total_matches = len(self.matches)
-        shown_matches = min(3, total_matches - self.offset)
-        remaining_matches = max(0, total_matches - self.offset - shown_matches)
+        status_y = status_top
+        for line in status_lines:
+            self._draw_text(
+                draw,
+                line,
+                (margin, status_y),
+                latin_font,
+                cjk_font,
+                "white",
+            )
+            status_y += font_size + 2
+        shown_matches = len(visible)
+        remaining_matches = max(
+            0, self.total_match_count - self.offset - shown_matches
+        )
         footer_text = (
-            f"{total_matches} matches  |  {remaining_matches} remaining"
+            f"{self.total_match_count} matches  |  {remaining_matches} remaining"
         )
         footer_width = self._text_width(
             footer_text, draw, latin_font, cjk_font
@@ -480,30 +637,116 @@ class HandshapeVideoLookup:
         )
 
         if not visible:
-            self._draw_text(
+            instruction = "Hold to show matches"
+            instruction_lines = self._wrap_text(
+                instruction,
                 draw,
-                "No matching signs",
-                (margin, content_top + margin),
-                latin_font,
-                cjk_font,
-                "white",
+                inner_width,
+                caption_latin_font,
+                caption_cjk_font,
             )
+            instruction_y = content_top + margin
+            instruction_line_height = (
+                caption_font_size + max(2, caption_font_size // 4)
+            )
+            for line in instruction_lines:
+                self._draw_text(
+                    draw,
+                    line,
+                    (margin, instruction_y),
+                    caption_latin_font,
+                    caption_cjk_font,
+                    "white",
+                )
+                instruction_y += instruction_line_height
         else:
             for index, (_, entry_id, entry, _) in enumerate(visible):
                 card_top = content_top + margin + index * (card_height + margin)
                 video_box_height = int(card_height * 0.54)
-                animation = self.animations[entry_id]
-                source_frame = animation.frame_at(now)
-                scale = min(
-                    panel_width / source_frame.width,
-                    video_box_height / source_frame.height,
-                )
-                video_size = (
-                    max(1, round(source_frame.width * scale)),
-                    max(1, round(source_frame.height * scale)),
-                )
-                video = source_frame.resize(video_size, Image.Resampling.LANCZOS)
-                base.alpha_composite(video, (0, card_top))
+                animation = self.animations.get(entry_id)
+                if isinstance(animation, Future):
+                    if not animation.done():
+                        animation = None
+                    else:
+                        animation = animation.result()
+                        self.animations[entry_id] = animation
+                if animation is not None:
+                    source_frame = animation.frame_at(now)
+                    scale = min(
+                        panel_width / source_frame.width,
+                        video_box_height / source_frame.height,
+                    )
+                    video_size = (
+                        max(1, round(source_frame.width * scale)),
+                        max(1, round(source_frame.height * scale)),
+                    )
+                    video = source_frame.resize(
+                        video_size, Image.Resampling.LANCZOS
+                    )
+                    base.alpha_composite(video, (0, card_top))
+                else:
+                    progress_state = self.video_load_progress.get(entry_id)
+                    progress = (
+                        progress_state[0] if progress_state is not None else 0.0
+                    )
+                    placeholder = f"Loading {round(progress * 100)}%"
+                    placeholder_box = draw.textbbox(
+                        (0, 0), placeholder, font=latin_font
+                    )
+                    placeholder_width = (
+                        placeholder_box[2] - placeholder_box[0]
+                    )
+                    placeholder_height = (
+                        placeholder_box[3] - placeholder_box[1]
+                    )
+                    draw.rectangle(
+                        (
+                            0,
+                            card_top,
+                            panel_width,
+                            card_top + video_box_height,
+                        ),
+                        fill=(20, 20, 20, 255),
+                    )
+                    draw.text(
+                        (
+                            (panel_width - placeholder_width) // 2
+                            - placeholder_box[0],
+                            card_top
+                            + (video_box_height - placeholder_height) // 2
+                            - placeholder_box[1],
+                        ),
+                        placeholder,
+                        font=latin_font,
+                        fill=(255, 255, 255, 255),
+                    )
+                    progress_margin = max(8, margin * 2)
+                    progress_left = progress_margin
+                    progress_right = panel_width - progress_margin
+                    progress_y = card_top + video_box_height - max(
+                        8, margin
+                    )
+                    draw.rectangle(
+                        (
+                            progress_left,
+                            progress_y,
+                            progress_right,
+                            progress_y + 4,
+                        ),
+                        fill=(90, 90, 90, 255),
+                    )
+                    draw.rectangle(
+                        (
+                            progress_left,
+                            progress_y,
+                            progress_left
+                            + round(
+                                (progress_right - progress_left) * progress
+                            ),
+                            progress_y + 4,
+                        ),
+                        fill=(80, 210, 120, 255),
+                    )
 
                 text_top = card_top + video_box_height + margin
                 lines = []
@@ -561,22 +804,31 @@ class ListBuffer:
     def stack_and_get(self): 
         return np.stack(self.buffer, axis=0)
 class HandDetection:
-    def __init__(self, model, video_path=None):
+    def __init__(
+        self,
+        model,
+        video_path=None,
+        lookup_batch_size=6,
+        performance_mode="low-end",
+    ):
         self.model = model
+        self.performance_mode = performance_mode
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
         self.handshape_dir = Path(__file__).resolve().parent / "hs_char"
         self.lookup = HandshapeVideoLookup(
-            Path(__file__).resolve().parent / "database"
+            Path(__file__).resolve().parent / "database",
+            batch_size=lookup_batch_size,
         )
         self.pending_handshapes = None
-        self.pending_handshapes_since = None
-        self.active_handshapes = None
         self.handshape_images = {}
         self.missing_handshape_images = set()
         self.saved_frames_hidrep_right = ListBuffer(10)
         self.saved_frames_hidrep_left = ListBuffer(10)
+        self.hidden_plot_right = None
+        self.hidden_plot_left = None
+        self.fallback_reason = None
         try_idxs = [-1, 0, 1, 2, -2]
 
         for idx in try_idxs:
@@ -586,7 +838,11 @@ class HandDetection:
                 break
             self.cap.release()
         if not self.cap.isOpened():
-            print("No webcam found! Loading a video file...")
+            self.fallback_reason = (
+                "No webcam detected. Playing fallback video: "
+                f"{Path(video_path).name if video_path else 'unavailable'}"
+            )
+            print(self.fallback_reason)
             if video_path and Path(video_path).is_file():
                 self.cap = cv2.VideoCapture(str(video_path))
             else:
@@ -662,7 +918,60 @@ class HandDetection:
 
         return canvas
 
+    def process_detection_frame(self, hands, frame):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = cv2.flip(rgb_frame, 1)
+        results = hands.process(rgb_frame)
+
+        right_lm = sol2json(results, None, "Right")
+        left_lm = sol2json(results, None, "Left")
+        hid_rep_right, pred_right = model_predict(
+            self.model, dict2array(right_lm), hsdict
+        )
+        hid_rep_left, pred_left = model_predict(
+            self.model, dict2array(left_lm), hsdict
+        )
+
+        annotated_frame = cv2.flip(frame.copy(), 1)
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                self.mp_drawing.draw_landmarks(
+                    annotated_frame,
+                    hand_landmarks,
+                    self.mp_hands.HAND_CONNECTIONS,
+                    self.mp_drawing_styles.get_default_hand_landmarks_style(),
+                    self.mp_drawing_styles.get_default_hand_connections_style(),
+                )
+
+        return (
+            annotated_frame,
+            hid_rep_right[0],
+            hid_rep_left[0],
+            pred_right[0],
+            pred_left[0],
+            right_lm["flag"],
+            left_lm["flag"],
+        )
+
+    def read_and_process_detection_frame(self, hands):
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        return self.process_detection_frame(hands, frame)
+
+    def update_handshape_matches(self, observed_handshapes):
+        if observed_handshapes == (None, None):
+            if self.pending_handshapes is not None:
+                self.pending_handshapes = None
+                self.lookup.update(None, None)
+        elif observed_handshapes != self.pending_handshapes:
+            self.pending_handshapes = observed_handshapes
+            self.lookup.update(*observed_handshapes)
+
     def detect(self):
+        detection_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hand-detection"
+        )
         try:
             window_name = "Hand Detection with Overlays"
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -682,81 +991,78 @@ class HandDetection:
                 max_num_hands=2,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5) as hands:
-                while self.cap.isOpened():
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        print("End of video or camera disconnected.")
-                        break
+                detection_future = None
+                latest_frame = None
+                hidden_plot_size = (350, 150)
+                pred_right = pred_left = chr(0)
+                right_flag = left_flag = FLAG_NONE
+                observed_handshapes = (None, None)
+                while True:
+                    if detection_future is not None and detection_future.done():
+                        detection_result = detection_future.result()
+                        detection_future = None
+                        if detection_result is None:
+                            print("End of video or camera disconnected.")
+                            break
+                        (
+                            latest_frame,
+                            hid_rep_right,
+                            hid_rep_left,
+                            pred_right,
+                            pred_left,
+                            right_flag,
+                            left_flag,
+                        ) = detection_result
+                        self.saved_frames_hidrep_right.append(hid_rep_right)
+                        self.saved_frames_hidrep_left.append(hid_rep_left)
+                        self.hidden_plot_right = self.plot_hidden_representation(
+                            self.saved_frames_hidrep_right.stack_and_get(),
+                            size=hidden_plot_size,
+                        )
+                        self.hidden_plot_left = self.plot_hidden_representation(
+                            self.saved_frames_hidrep_left.stack_and_get(),
+                            size=hidden_plot_size,
+                        )
+                        observed_handshapes = (
+                            ord(pred_right) if right_flag == FLAG_OK else None,
+                            ord(pred_left) if left_flag == FLAG_OK else None,
+                        )
 
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    rgb_frame = cv2.flip(rgb_frame, 1)  # Mirror effect
-                    results = hands.process(rgb_frame)
+                    if detection_future is None:
+                        detection_future = detection_executor.submit(
+                            self.read_and_process_detection_frame, hands
+                        )
 
-                    right_lm = sol2json(results, None, "Right")
-                    left_lm = sol2json(results, None, "Left")
-                    right_lm_array = dict2array(right_lm)
-                    left_lm_array = dict2array(left_lm)
+                    self.update_handshape_matches(observed_handshapes)
+                    if latest_frame is None:
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in (ord("q"), ord("Q")):
+                            break
+                        continue
 
-                    hid_rep_right, pred_right = model_predict(self.model, right_lm_array, hsdict)
-                    hid_rep_left, pred_left = model_predict(self.model, left_lm_array, hsdict)
-                    self.saved_frames_hidrep_right.append(hid_rep_right[0])
-                    self.saved_frames_hidrep_left.append(hid_rep_left[0])
-
-                    observed_handshapes = (
-                        ord(pred_right[0]) if right_lm["flag"] == FLAG_OK else None,
-                        ord(pred_left[0]) if left_lm["flag"] == FLAG_OK else None,
-                    )
-                    if observed_handshapes == (None, None):
-                        self.pending_handshapes = None
-                        self.pending_handshapes_since = None
-                    else:
-                        now = time.monotonic()
-                        if observed_handshapes != self.pending_handshapes:
-                            self.pending_handshapes = observed_handshapes
-                            self.pending_handshapes_since = now
-                        elif (
-                            self.pending_handshapes_since is not None
-                            and now - self.pending_handshapes_since >= 1
-                        ):
-                            if observed_handshapes != self.active_handshapes:
-                                self.active_handshapes = observed_handshapes
-                                self.lookup.update(*observed_handshapes)
-                            self.pending_handshapes_since = None
-                    self.lookup.update_handshape_timeout(
-                        self.pending_handshapes_since
-                    )
-
-                    annotated_frame = cv2.flip(frame.copy(), 1)
-                    if results.multi_hand_landmarks:
-                        for hand_landmarks in results.multi_hand_landmarks:
-                            self.mp_drawing.draw_landmarks(
-                                annotated_frame,
-                                hand_landmarks,
-                                self.mp_hands.HAND_CONNECTIONS,
-                                self.mp_drawing_styles.get_default_hand_landmarks_style(),
-                                self.mp_drawing_styles.get_default_hand_connections_style()
-                            )
-
+                    annotated_frame = latest_frame.copy()
                     height, width = annotated_frame.shape[:2]
                     banner_height = max(56, height // 12)
 
-                    hidden_plot_size = (350, 150)
-                    hidden_plot_right = self.plot_hidden_representation(self.saved_frames_hidrep_right.stack_and_get(), size=hidden_plot_size)
-                    hidden_plot_left = self.plot_hidden_representation(self.saved_frames_hidrep_left.stack_and_get(), size=hidden_plot_size)
                     footer_height = max(34, height // 20)
                     plot_margin = max(20, width // 40)
                     plot_x = max(0, width - hidden_plot_size[0] - plot_margin)
                     plot_y_right = banner_height + plot_margin
                     plot_y_left = plot_y_right + hidden_plot_size[1] + plot_margin
-                    if plot_y_left + hidden_plot_size[1] <= height - footer_height - plot_margin:
+                    if (
+                        self.hidden_plot_right is not None
+                        and self.hidden_plot_left is not None
+                        and plot_y_left + hidden_plot_size[1]
+                        <= height - footer_height - plot_margin
+                    ):
                         annotated_frame[
                             plot_y_right:plot_y_right + hidden_plot_size[1],
                             plot_x:plot_x + hidden_plot_size[0],
-                        ] = hidden_plot_right
+                        ] = self.hidden_plot_right
                         annotated_frame[
                             plot_y_left:plot_y_left + hidden_plot_size[1],
                             plot_x:plot_x + hidden_plot_size[0],
-                        ] = hidden_plot_left
+                        ] = self.hidden_plot_left
 
                     overlay = annotated_frame.copy()
                     cv2.rectangle(overlay, (0, 0), (width, banner_height), (0, 0, 0), -1)
@@ -769,9 +1075,12 @@ class HandDetection:
                     )
                     cv2.addWeighted(overlay, 0.65, annotated_frame, 0.35, 0, annotated_frame)
 
-                    title = "HKU Linguistics: HKSL Handshape Detection Model Demonstration"
+                    title = "HKU Linguistics: HKSL Handshape Detection Model Prototype Demo"
                     footer = (
-                        f"[W] +10%  [E] -10%  Resolution: {resolution_percent}%  [Q] Quit"
+                        f"[W] +10%  [E] -10%  Resolution: {resolution_percent}%  "
+                        f"[1] Low-end{'*' if self.performance_mode == 'low-end' else ''}  "
+                        f"[2] Standard{'*' if self.performance_mode == 'standard' else ''}  "
+                        f"[Q] Quit"
                     )
                     text_image = Image.fromarray(
                         cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
@@ -783,6 +1092,13 @@ class HandDetection:
                     )
                     title_cjk_font = self.lookup.get_font(
                         "GenKiGothic2TW-R.otf", title_font_size
+                    )
+                    fallback_font_size = max(12, title_font_size // 2)
+                    fallback_font = self.lookup.get_font(
+                        "PublicSans-Regular.ttf", fallback_font_size
+                    )
+                    fallback_cjk_font = self.lookup.get_font(
+                        "GenKiGothic2TW-R.otf", fallback_font_size
                     )
                     footer_font_size = max(14, footer_height // 3)
                     footer_font = self.lookup.get_font(
@@ -800,11 +1116,45 @@ class HandDetection:
                     self.lookup._draw_text(
                         text_draw,
                         title,
-                        (max(10, (width - title_width) // 2), (banner_height - title_font_size) // 2),
+                        (
+                            max(10, width - title_width - 10),
+                            (
+                                max(
+                                    4,
+                                    (
+                                        banner_height
+                                        - title_font_size
+                                        - fallback_font_size
+                                        - 12
+                                    )
+                                    // 2,
+                                )
+                                if self.fallback_reason
+                                else (banner_height - title_font_size) // 2
+                            ),
+                        ),
                         title_font,
                         title_cjk_font,
                         (255, 255, 255),
                     )
+                    if self.fallback_reason:
+                        fallback_width = self.lookup._text_width(
+                            self.fallback_reason,
+                            text_draw,
+                            fallback_font,
+                            fallback_cjk_font,
+                        )
+                        self.lookup._draw_text(
+                            text_draw,
+                            self.fallback_reason,
+                            (
+                                max(10, (width - fallback_width) // 2),
+                                banner_height - fallback_font_size - 4,
+                            ),
+                            fallback_font,
+                            fallback_cjk_font,
+                            (255, 220, 120),
+                        )
                     self.lookup._draw_text(
                         text_draw,
                         footer,
@@ -839,17 +1189,13 @@ class HandDetection:
                     indicator_y = max(4, (header_height - indicator_size) // 2)
                     render_frame = self.overlay_handshape(
                         render_frame,
-                        pred_left[0]
-                        if left_lm["flag"] == FLAG_OK
-                        else chr(0),
+                        pred_left if left_flag == FLAG_OK else chr(0),
                         position=(indicator_margin, indicator_y),
                         size=(indicator_size, indicator_size),
                     )
                     render_frame = self.overlay_handshape(
                         render_frame,
-                        pred_right[0]
-                        if right_lm["flag"] == FLAG_OK
-                        else chr(0),
+                        pred_right if right_flag == FLAG_OK else chr(0),
                         position=(
                             indicator_margin + indicator_size + 10 + indicator_gap,
                             indicator_y,
@@ -864,28 +1210,64 @@ class HandDetection:
                         resolution_percent = min(100, resolution_percent + 10)
                     elif key in (ord('e'), ord('E')):
                         resolution_percent = max(10, resolution_percent - 10)
+                    elif key == ord('1'):
+                        self.performance_mode = "low-end"
+                        self.lookup.set_batch_size(6)
+                    elif key == ord('2'):
+                        self.performance_mode = "standard"
+                        self.lookup.set_batch_size(12)
         finally:
+            detection_executor.shutdown(wait=True)
             self.cap.release()
+            self.lookup.close()
             cv2.destroyAllWindows()
 
 def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = LinearHandshapePredictor(
-        input_dim=in_dim, 
-        enc_lat_dims=enc_lat_dims, 
-        hid_dim=hid_dim, 
-        dec_lat_dims=dec_lat_dims, 
-        output_dim=out_dim
-    )
-    model_path = Path(__file__).resolve().parent / "597.pt"
-    state = torch.load(model_path, map_location="cpu")
-    model.load_state_dict(state)
-    model.to(device)
-    model.eval()
+    import argparse
+    import traceback
 
-    video_path = Path(__file__).resolve().parent / "B_01_079-NOTHING-0KC7-67.mp4"
-    detector = HandDetection(model=model, video_path=video_path)
-    detector.detect()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--performance-mode",
+        choices=("low-end", "standard"),
+        default="low-end",
+    )
+    args = parser.parse_args()
+
+    try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = LinearHandshapePredictor(
+            input_dim=in_dim,
+            enc_lat_dims=enc_lat_dims,
+            hid_dim=hid_dim,
+            dec_lat_dims=dec_lat_dims,
+            output_dim=out_dim
+        )
+        model_path = Path(__file__).resolve().parent / "597.pt"
+        state = torch.load(model_path, map_location="cpu")
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+
+        video_path = (
+            Path(__file__).resolve().parent
+            / "B_01_079-NOTHING-0KC7-67.mp4"
+        )
+        lookup_batch_size = 6 if args.performance_mode == "low-end" else 12
+        detector = HandDetection(
+            model=model,
+            video_path=video_path,
+            lookup_batch_size=lookup_batch_size,
+            performance_mode=args.performance_mode,
+        )
+        detector.detect()
+    except Exception:
+        traceback.print_exc()
+        try:
+            input("Demo failed. Press Enter to exit...")
+        except EOFError:
+            pass
+        raise SystemExit(1) from None
 
 if __name__ == '__main__':
     main()

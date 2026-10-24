@@ -5,8 +5,8 @@ from pathlib import Path
 DATABASE_DIR = Path(__file__).resolve().parent
 SOURCE_PATH = DATABASE_DIR / "data.json"
 OUTPUT_PATH = DATABASE_DIR / "data.lookup.json"
-LOOKUP_SCHEMA_VERSION = 5
-PRECOMPUTED_RESULT_LIMIT = 12
+LOOKUP_SCHEMA_VERSION = 8
+PRECOMPUTED_MATCH_LIMIT = 60
 
 
 def parse_codepoint_pairs(notation):
@@ -144,14 +144,13 @@ def build_lookup():
                 len(ranked_matches),
                 [
                     entries[match[2]]["video"]
-                    for match in ranked_matches[:PRECOMPUTED_RESULT_LIMIT]
+                    for match in ranked_matches[:PRECOMPUTED_MATCH_LIMIT]
                 ],
             ]
 
     result = {
         "schema_version": LOOKUP_SCHEMA_VERSION,
         "entries": entries,
-        "by_codepoint": by_codepoint,
         "precomputed": precomputed,
     }
     with OUTPUT_PATH.open("w", encoding="utf-8", newline="\n") as output_file:

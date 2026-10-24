@@ -1,10 +1,12 @@
 import json
+import random
 import subprocess
 import sys
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 import cv2
 import mediapipe as mp
@@ -146,44 +148,76 @@ def translation_lines(entry):
 class AnimatedWebP:
     MAX_FRAME_SIZE = (240, 135)
 
-    def __init__(self, path, on_progress=None):
+    def __init__(self, path):
         self.path = path
         self.frames = []
         self.durations = []
-        with Image.open(path) as webp:
+        self.decoded_bytes = 0
+        self.decoded_duration = 0
+        self.loop_duration = 0
+        self.started_at = time.monotonic()
+        self.loaded = False
+        self.lock = Lock()
+
+    def load(self, on_progress=None):
+        with Image.open(self.path) as webp:
             frame_count = max(1, getattr(webp, "n_frames", 1))
             for frame_index in range(frame_count):
                 webp.seek(frame_index)
                 frame = webp.convert("RGBA")
                 frame.thumbnail(self.MAX_FRAME_SIZE, Image.Resampling.LANCZOS)
-                self.frames.append(frame.copy())
-                duration = max(10, int(webp.info.get("duration", 100))) / 1000
-                self.durations.append(duration)
+                with self.lock:
+                    self.frames.append(frame.copy())
+                    self.durations.append(
+                        max(10, int(webp.info.get("duration", 100))) / 1000
+                    )
+                    self.decoded_bytes += frame.width * frame.height * 4
+                    self.decoded_duration += self.durations[-1]
                 if on_progress is not None:
                     on_progress((frame_index + 1) / frame_count)
 
-        if not self.frames:
-            raise ValueError(f"WebP contains no frames: {path}")
-
-        self.loop_duration = sum(self.durations)
-        self.started_at = time.monotonic()
+        with self.lock:
+            if not self.frames:
+                raise ValueError(f"WebP contains no frames: {self.path}")
+            self.loop_duration = sum(self.durations)
+            self.started_at = time.monotonic()
+            self.loaded = True
 
     def frame_at(self, now):
-        position = (now - self.started_at) % self.loop_duration
-        for frame, duration in zip(self.frames, self.durations):
-            if position < duration:
-                return frame
-            position -= duration
-        return self.frames[-1]
+        with self.lock:
+            if not self.frames:
+                return None
+            position = max(0, now - self.started_at)
+            if self.loaded:
+                position %= self.loop_duration
+            else:
+                position %= self.decoded_duration
+            for frame, duration in zip(self.frames, self.durations):
+                if position < duration:
+                    return frame
+                position -= duration
+            return self.frames[-1]
+
+    @property
+    def has_frames(self):
+        with self.lock:
+            return bool(self.frames)
+
+    @property
+    def is_loaded(self):
+        with self.lock:
+            return self.loaded
 
 
 class HandshapeVideoLookup:
-    LOOKUP_SCHEMA_VERSION = 5
+    LOOKUP_SCHEMA_VERSION = 8
     PRECOMPUTED_RESULT_LIMIT = 12
+    ANIMATION_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 
-    def __init__(self, database_dir, batch_size=6):
+    def __init__(self, database_dir, batch_size=6, performance_mode="low-end"):
         self.video_dir = database_dir / "webp"
         self.batch_size = batch_size
+        self.performance_mode = performance_mode
         lookup_path = database_dir / "data.lookup.json"
         builder_path = database_dir / "build_handshape_lookup.py"
         source_path = database_dir / "data.json"
@@ -212,7 +246,6 @@ class HandshapeVideoLookup:
         self.entry_by_video = {
             entry["video"]: entry for entry in self.entries
         }
-        self.by_codepoint = lookup_data["by_codepoint"]
         self.precomputed = lookup_data["precomputed"]
         self.matches = []
         self.offset = 0
@@ -220,12 +253,17 @@ class HandshapeVideoLookup:
         self.total_match_count = 0
         self.window_started_at = None
         self.animations = {}
+        self.animation_cache = OrderedDict()
+        self.animation_cache_bytes = 0
+        self.ANIMATION_CACHE_LIMIT_BYTES = (0.5 if self.performance_mode == "low-end" else 1.0) * 1024 * 1024 * 1024
+        self.loading_animations = {}
         self.video_load_progress = {}
         self.query_key = None
+        self.initial_match_count = 0
         self.continuation_future = None
-        self.loading_more = False
-        self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="handshape-lookup"
+        self.continuation_query_key = None
+        self.continuation_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="handshape-full-lookup"
         )
         self.video_executor = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="webp-loader"
@@ -250,19 +288,57 @@ class HandshapeVideoLookup:
             )
         return self.digit_width_cache[key]
 
+    def update(self, right_codepoint, left_codepoint):
+        query_key = self._query_key(right_codepoint, left_codepoint)
+        if query_key == self.query_key:
+            return
+
+        if self.continuation_future is not None:
+            self.continuation_future.cancel()
+        self.continuation_future = None
+        self.continuation_query_key = None
+        self.query_key = query_key
+        self._load_query_matches()
+
+    def _load_query_matches(self):
+        match_count, video_names = self.precomputed.get(self.query_key, (0, ()))
+        self.total_match_count = match_count
+        video_names = video_names[:]
+        if (
+            self.performance_mode == "standard"
+            and len(video_names) > self.PRECOMPUTED_RESULT_LIMIT
+        ):
+            video_names = random.sample(
+                video_names, self.PRECOMPUTED_RESULT_LIMIT
+            )
+        else:
+            video_names = video_names[:self.PRECOMPUTED_RESULT_LIMIT]
+        self.matches = self._make_matches(video_names)
+        self.initial_match_count = len(self.matches)
+        self.offset = 0
+        self.loaded_until = min(3, len(self.matches))
+        self._keep_visible_animations()
+        self.window_started_at = None
+
+    def _make_matches(self, video_names):
+        self.matches = [
+            (
+                (0, 0),
+                self.entry_by_video[video_name]["id"],
+                self.entry_by_video[video_name],
+                self.video_dir / video_name,
+            )
+            for video_name in video_names
+        ]
+        return self.matches
+
     def _matching_entries(self, right_codepoint, left_codepoint):
         matches = []
-        candidate_indexes = set()
-        for codepoint in (right_codepoint, left_codepoint):
-            if codepoint is not None:
-                candidate_indexes.update(
-                    self.by_codepoint.get(str(codepoint), ())
-                )
-
-        for entry_index in candidate_indexes:
-            entry = self.entries[entry_index]
+        for entry in self.entries:
             best_rank = None
-            for pair_index, (dominant, non_dominant) in enumerate(entry["pairs"]):
+            for pair_index, (dominant, non_dominant) in enumerate(
+                entry["pairs"]
+            ):
                 rank = None
                 if (
                     right_codepoint is not None
@@ -296,87 +372,48 @@ class HandshapeVideoLookup:
                     candidate_rank = (pair_index, rank)
                     if best_rank is None or candidate_rank < best_rank:
                         best_rank = candidate_rank
-
-            if best_rank is None:
-                continue
-
-            video_path = self.video_dir / entry["video"]
-            matches.append((best_rank, entry["id"], entry, video_path))
-
+            if best_rank is not None:
+                matches.append(
+                    (
+                        best_rank,
+                        entry["id"],
+                        entry,
+                        self.video_dir / entry["video"],
+                    )
+                )
         matches.sort(key=lambda match: (match[0], match[3].name))
         return matches
 
-    def update(self, right_codepoint, left_codepoint):
-        query_key = self._query_key(right_codepoint, left_codepoint)
-        if query_key == self.query_key:
-            return
-
-        if self.continuation_future is not None:
-            self.continuation_future.cancel()
-        self.continuation_future = None
-        self.loading_more = False
-        self.query_key = query_key
-        match_count, video_names = self.precomputed.get(query_key, (0, ()))
-        self.total_match_count = match_count
-        self.matches = self._make_matches(video_names)
-        self.offset = 0
-        self.loaded_until = min(3, len(self.matches))
-        self._keep_visible_animations()
-        self.window_started_at = None
-
-    def _make_matches(self, video_names):
-        self.matches = [
-            (
-                (0, 0),
-                self.entry_by_video[video_name]["id"],
-                self.entry_by_video[video_name],
-                self.video_dir / video_name,
-            )
-            for video_name in video_names
-        ]
-        return self.matches
-
-    @staticmethod
-    def _query_key(right_codepoint, left_codepoint):
-        right = "" if right_codepoint is None else str(right_codepoint)
-        left = "" if left_codepoint is None else str(left_codepoint)
-        return f"{right},{left}"
-
     def _load_remaining_matches(
-        self,
-        right_codepoint,
-        left_codepoint,
-        first_batch_files,
-        expected_count,
+        self, query_key, selected_video_names, expected_count
     ):
-        ranked_matches = self._matching_entries(right_codepoint, left_codepoint)
-        remaining = [
-            match for match in ranked_matches if match[3].name not in first_batch_files
-        ]
-        if len(remaining) + len(first_batch_files) != expected_count:
-            raise ValueError(
-                "Precomputed lookup count does not match indexed lookup results."
-            )
-        return remaining
-
-    def _start_remaining_lookup(self):
-        if self.continuation_future is not None or not self.query_key:
-            return
-        if len(self.matches) >= self.total_match_count:
-            return
-        right, left = self.query_key.split(",", maxsplit=1)
+        right, left = query_key.split(",", maxsplit=1)
         right_codepoint = int(right) if right else None
         left_codepoint = int(left) if left else None
-        first_batch_files = {
-            match[3].name
-            for match in self.matches[:self.PRECOMPUTED_RESULT_LIMIT]
-        }
-        self.loading_more = True
-        self.continuation_future = self.executor.submit(
+        all_matches = self._matching_entries(right_codepoint, left_codepoint)
+        if len(all_matches) != expected_count:
+            raise ValueError(
+                "Precomputed total does not match full handshape lookup."
+            )
+        return [
+            match
+            for match in all_matches
+            if match[3].name not in selected_video_names
+        ]
+
+    def _start_remaining_lookup(self):
+        if (
+            self.continuation_future is not None
+            or self.initial_match_count < self.PRECOMPUTED_RESULT_LIMIT
+            or len(self.matches) >= self.total_match_count
+        ):
+            return
+        selected_video_names = {match[3].name for match in self.matches}
+        self.continuation_query_key = self.query_key
+        self.continuation_future = self.continuation_executor.submit(
             self._load_remaining_matches,
-            right_codepoint,
-            left_codepoint,
-            first_batch_files,
+            self.query_key,
+            selected_video_names,
             self.total_match_count,
         )
 
@@ -384,56 +421,121 @@ class HandshapeVideoLookup:
         future = self.continuation_future
         if future is None or not future.done():
             return
-        self.matches.extend(future.result())
+        query_key = self.continuation_query_key
         self.continuation_future = None
-        self.loading_more = False
+        self.continuation_query_key = None
+        remaining = future.result()
+        if query_key == self.query_key:
+            self.matches.extend(remaining)
+
+    @staticmethod
+    def _query_key(right_codepoint, left_codepoint):
+        right = "" if right_codepoint is None else str(right_codepoint)
+        left = "" if left_codepoint is None else str(left_codepoint)
+        return f"{right},{left}"
 
     def close(self):
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.continuation_executor.shutdown(wait=False, cancel_futures=True)
         self.video_executor.shutdown(wait=False, cancel_futures=True)
 
-    def set_batch_size(self, batch_size):
+    def set_performance_mode(self, performance_mode, batch_size):
+        if performance_mode not in ("low-end", "standard"):
+            raise ValueError(f"Unsupported performance mode: {performance_mode}")
         if batch_size <= 0:
             raise ValueError(f"Batch size must be positive: {batch_size}")
+        if (
+            performance_mode == self.performance_mode
+            and batch_size == self.batch_size
+        ):
+            return
+        self.performance_mode = performance_mode
         self.batch_size = batch_size
+        self.ANIMATION_CACHE_LIMIT_BYTES = (0.5 if performance_mode == "low-end" else 1.0) * 1024 * 1024 * 1024
+        if self.query_key is not None:
+            if self.continuation_future is not None:
+                self.continuation_future.cancel()
+            self.continuation_future = None
+            self.continuation_query_key = None
+            self._load_query_matches()
         if self.matches:
             self.loaded_until = min(
                 len(self.matches),
-                max(self.offset + 3, (self.offset // batch_size + 1) * batch_size),
+                max(
+                    self.offset + 3,
+                    (self.offset // batch_size + 1) * batch_size,
+                ),
             )
+
+    def _cache_animation(self, entry_id, animation, protected_ids):
+        previous = self.animation_cache.pop(entry_id, None)
+        if previous is not None:
+            self.animation_cache_bytes -= previous.decoded_bytes
+        if animation.decoded_bytes > self.ANIMATION_CACHE_LIMIT_BYTES:
+            return
+
+        self.animation_cache[entry_id] = animation
+        self.animation_cache_bytes += animation.decoded_bytes
+        while self.animation_cache_bytes > self.ANIMATION_CACHE_LIMIT_BYTES:
+            evict_id = next(
+                (
+                    cached_id
+                    for cached_id in self.animation_cache
+                    if cached_id not in protected_ids
+                ),
+                None,
+            )
+            if evict_id is None:
+                break
+            evicted = self.animation_cache.pop(evict_id)
+            self.animation_cache_bytes -= evicted.decoded_bytes
 
     def _keep_visible_animations(self):
         visible = self.matches[self.offset:min(self.offset + 3, self.loaded_until)]
         active_ids = {match[1] for match in visible}
-        for entry_id, animation in self.animations.items():
-            if entry_id not in active_ids and isinstance(animation, Future):
-                animation.cancel()
-        self.animations = {
-            entry_id: animation
-            for entry_id, animation in self.animations.items()
-            if entry_id in active_ids
-        }
-        self.video_load_progress = {
-            entry_id: progress
-            for entry_id, progress in self.video_load_progress.items()
-            if entry_id in active_ids
-        }
+        for entry_id, (future, animation) in list(
+            self.loading_animations.items()
+        ):
+            if future.done():
+                future.result()
+                del self.loading_animations[entry_id]
+                self.video_load_progress.pop(entry_id, None)
+                if self.animation_cache_bytes + animation.decoded_bytes <= self.ANIMATION_CACHE_LIMIT_BYTES:
+                    self._cache_animation(entry_id, animation, active_ids)
+                else:
+                    # Stop caching when limit reached
+                    pass
+            elif entry_id not in active_ids and future.cancel():
+                del self.loading_animations[entry_id]
+                self.video_load_progress.pop(entry_id, None)
+
+        self.animations = {}
         for _, entry_id, _, video_path in visible:
-            animation = self.animations.get(entry_id)
-            if isinstance(animation, Future):
-                if animation.done():
-                    self.animations[entry_id] = animation.result()
-                    self.video_load_progress.pop(entry_id, None)
-            elif animation is None:
+            animation = self.animation_cache.get(entry_id)
+            if animation is not None:
+                self.animation_cache.move_to_end(entry_id)
+                self.animations[entry_id] = animation
+                continue
+
+            loading = self.loading_animations.get(entry_id)
+            if loading is None:
+                # Only start loading if there is space for it
+                # Note: we don't know the size yet, but we can check if we are already at the limit
+                # Or just load it and let _cache_animation handle it.
+                # The requirement says "stop caching more videos when loading" when reached.
+                # So we load it to show it, but don't put it in the LRU cache.
+                animation = AnimatedWebP(video_path)
                 progress_state = [0.0]
                 self.video_load_progress[entry_id] = progress_state
-                self.animations[entry_id] = self.video_executor.submit(
-                    AnimatedWebP,
-                    video_path,
+                future = self.video_executor.submit(
+                    animation.load,
                     lambda progress, state=progress_state: state.__setitem__(
                         0, progress
                     ),
                 )
+                self.loading_animations[entry_id] = (future, animation)
+            else:
+                _, animation = loading
+            self.animations[entry_id] = animation
 
     def visible_matches(self, now):
         self._finish_remaining_lookup()
@@ -451,27 +553,21 @@ class HandshapeVideoLookup:
 
         lead = self.matches[self.offset]
         lead_animation = self.animations.get(lead[1])
-        if isinstance(lead_animation, Future):
-            if not lead_animation.done():
-                return self.matches[
-                    self.offset:min(self.offset + 3, self.loaded_until)
-                ]
-            lead_animation = lead_animation.result()
-            self.animations[lead[1]] = lead_animation
-        if not isinstance(lead_animation, AnimatedWebP):
+        if (
+            not isinstance(lead_animation, AnimatedWebP)
+            or not lead_animation.has_frames
+        ):
             return self.matches[
                 self.offset:min(self.offset + 3, self.loaded_until)
             ]
-        if self.window_started_at is None:
+        if self.window_started_at is None and lead_animation.is_loaded:
             self.window_started_at = now
             lead_animation.started_at = now
-        if (
-            self.offset >= self.PRECOMPUTED_RESULT_LIMIT - 1
-            and self.total_match_count > self.PRECOMPUTED_RESULT_LIMIT
-        ):
+        if self.offset >= self.initial_match_count - 2:
             self._start_remaining_lookup()
         if (
-            self.offset < self.total_match_count - 1
+            lead_animation.is_loaded
+            and self.offset < self.total_match_count - 1
             and self.offset < len(self.matches) - 1
             and self.window_started_at is not None
             and now - self.window_started_at >= lead_animation.loop_duration
@@ -559,8 +655,6 @@ class HandshapeVideoLookup:
             screen_width
         )
         footer_height = max(24, screen_height // 30)
-        status_lines = []
-        status_height = 0
         base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
@@ -571,19 +665,7 @@ class HandshapeVideoLookup:
         latin_font = self.get_font("PublicSans-Regular.ttf", font_size)
         cjk_font = self.get_font("GenKiGothic2TW-R.otf", font_size)
         inner_width = max(1, panel_width - 2 * margin)
-        if self.loading_more:
-            status_lines = self._wrap_text(
-                "Looking up full matches...",
-                draw,
-                inner_width,
-                latin_font,
-                cjk_font,
-            )
-            status_top = header_height + margin
-            status_height = margin + len(status_lines) * (font_size + 2)
-        else:
-            status_top = header_height
-        content_top = header_height + status_height
+        content_top = header_height
         content_height = max(
             1, screen_height - content_top - footer_height
         )
@@ -606,20 +688,9 @@ class HandshapeVideoLookup:
         id_latin_font = self.get_font("PublicSans-Regular.ttf", id_font_size)
         id_cjk_font = self.get_font("GenKiGothic2TW-R.otf", id_font_size)
         draw = ImageDraw.Draw(base)
-        status_y = status_top
-        for line in status_lines:
-            self._draw_text(
-                draw,
-                line,
-                (margin, status_y),
-                latin_font,
-                cjk_font,
-                "white",
-            )
-            status_y += font_size + 2
         shown_matches = len(visible)
         remaining_matches = max(
-            0, self.total_match_count - self.offset - shown_matches
+            0, len(self.matches) - self.offset - shown_matches
         )
         footer_text = (
             f"{self.total_match_count} matches  |  {remaining_matches} remaining"
@@ -664,14 +735,11 @@ class HandshapeVideoLookup:
                 card_top = content_top + margin + index * (card_height + margin)
                 video_box_height = int(card_height * 0.54)
                 animation = self.animations.get(entry_id)
-                if isinstance(animation, Future):
-                    if not animation.done():
-                        animation = None
-                    else:
-                        animation = animation.result()
-                        self.animations[entry_id] = animation
                 if animation is not None:
                     source_frame = animation.frame_at(now)
+                else:
+                    source_frame = None
+                if source_frame is not None:
                     scale = min(
                         panel_width / source_frame.width,
                         video_box_height / source_frame.height,
@@ -820,6 +888,7 @@ class HandDetection:
         self.lookup = HandshapeVideoLookup(
             Path(__file__).resolve().parent / "database",
             batch_size=lookup_batch_size,
+            performance_mode=performance_mode,
         )
         self.pending_handshapes = None
         self.handshape_images = {}
@@ -1080,6 +1149,7 @@ class HandDetection:
                         f"[W] +10%  [E] -10%  Resolution: {resolution_percent}%  "
                         f"[1] Low-end{'*' if self.performance_mode == 'low-end' else ''}  "
                         f"[2] Standard{'*' if self.performance_mode == 'standard' else ''}  "
+                        f"[S] Cap+ [D] Cap- [R] Purge  "
                         f"[Q] Quit"
                     )
                     text_image = Image.fromarray(
@@ -1163,6 +1233,20 @@ class HandDetection:
                         footer_cjk_font,
                         (255, 255, 255),
                     )
+                    mem_mib = self.lookup.animation_cache_bytes / 1024 / 1024
+                    mem_limit_mib = self.lookup.ANIMATION_CACHE_LIMIT_BYTES / 1024 / 1024
+                    mem_text = f"MEM: {mem_mib:.1f}/{mem_limit_mib:.1f} MiB"
+                    mem_width = self.lookup._text_width(
+                        mem_text, text_draw, footer_font, footer_cjk_font
+                    )
+                    self.lookup._draw_text(
+                        text_draw,
+                        mem_text,
+                        (width - mem_width - 10, height - footer_height + (footer_height - footer_font_size) // 2),
+                        footer_font,
+                        footer_cjk_font,
+                        (255, 255, 255),
+                    )
                     annotated_frame = cv2.cvtColor(
                         np.asarray(text_image), cv2.COLOR_RGB2BGR
                     )
@@ -1212,10 +1296,19 @@ class HandDetection:
                         resolution_percent = max(10, resolution_percent - 10)
                     elif key == ord('1'):
                         self.performance_mode = "low-end"
-                        self.lookup.set_batch_size(6)
+                        self.lookup.set_performance_mode("low-end", 6)
                     elif key == ord('2'):
                         self.performance_mode = "standard"
-                        self.lookup.set_batch_size(12)
+                        self.lookup.set_performance_mode("standard", 12)
+                    elif key == ord('s') or key == ord('S'):
+                        self.lookup.ANIMATION_CACHE_LIMIT_BYTES += 100 * 1024 * 1024
+                    elif key == ord('d') or key == ord('D'):
+                        self.lookup.ANIMATION_CACHE_LIMIT_BYTES = max(
+                            0, self.lookup.ANIMATION_CACHE_LIMIT_BYTES - 100 * 1024 * 1024
+                        )
+                    elif key == ord('r') or key == ord('R'):
+                        self.lookup.animation_cache.clear()
+                        self.lookup.animation_cache_bytes = 0
         finally:
             detection_executor.shutdown(wait=True)
             self.cap.release()
